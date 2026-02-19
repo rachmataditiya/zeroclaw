@@ -46,7 +46,7 @@ pub use cron_remove::CronRemoveTool;
 pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
-pub use delegate::DelegateTool;
+pub use delegate::{DelegateTaskManager, DelegateTool};
 pub use file_edit::FileEditTool;
 pub use file_list::FileListTool;
 pub use file_read::FileReadTool;
@@ -135,9 +135,12 @@ pub fn all_tools(
     )
 }
 
-/// Create full tool registry including memory tools and optional Composio.
-#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
-pub fn all_tools_with_runtime(
+/// Build the core tool set (everything except delegate).
+///
+/// This is extracted so it can be called twice: once for the main tool registry,
+/// and once to provide parent tools to the DelegateTool for full-mode sub-agents.
+#[allow(clippy::too_many_arguments)]
+fn build_core_tools(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
@@ -147,8 +150,6 @@ pub fn all_tools_with_runtime(
     browser_config: &crate::config::BrowserConfig,
     http_config: &crate::config::HttpRequestConfig,
     workspace_dir: &std::path::Path,
-    agents: &HashMap<String, DelegateAgentConfig>,
-    fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![
@@ -186,12 +187,10 @@ pub fn all_tools_with_runtime(
     ];
 
     if browser_config.enabled {
-        // Add legacy browser_open tool for simple URL opening
         tools.push(Box::new(BrowserOpenTool::new(
             security.clone(),
             browser_config.allowed_domains.clone(),
         )));
-        // Add full browser automation tool (pluggable backend)
         tools.push(Box::new(BrowserTool::new_with_backend(
             security.clone(),
             browser_config.allowed_domains.clone(),
@@ -221,14 +220,12 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // Web fetch tool — reuses http_request domain allowlist and timeout
     tools.push(Box::new(WebFetchTool::new(
         security.clone(),
         http_config.allowed_domains.clone(),
         http_config.timeout_secs,
     )));
 
-    // Web search tool (enabled by default for GLM and other models)
     if root_config.web_search.enabled {
         tools.push(Box::new(WebSearchTool::new(
             root_config.web_search.provider.clone(),
@@ -238,7 +235,6 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // Vision tools are always available
     tools.push(Box::new(ScreenshotTool::new(security.clone())));
     tools.push(Box::new(ImageInfoTool::new(security.clone())));
 
@@ -252,8 +248,57 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // Add delegation tool when agents are configured
+    tools
+}
+
+/// Create full tool registry including memory tools and optional Composio.
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+pub fn all_tools_with_runtime(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &crate::config::BrowserConfig,
+    http_config: &crate::config::HttpRequestConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, DelegateAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &crate::config::Config,
+) -> Vec<Box<dyn Tool>> {
+    let mut tools = build_core_tools(
+        config.clone(),
+        security,
+        runtime.clone(),
+        memory.clone(),
+        composio_key,
+        composio_entity_id,
+        browser_config,
+        http_config,
+        workspace_dir,
+        root_config,
+    );
+
+    // Add delegation tool when agents are configured, wiring parent tools
+    // so full-mode sub-agents can use them. Parent tools exclude delegate
+    // itself to prevent circular references; recursion is handled by depth limits.
     if !agents.is_empty() {
+        let parent_tools = Arc::new(build_core_tools(
+            config,
+            security,
+            runtime,
+            memory,
+            composio_key,
+            composio_entity_id,
+            browser_config,
+            http_config,
+            workspace_dir,
+            root_config,
+        ));
+
+        let task_manager = Arc::new(DelegateTaskManager::new());
+
         let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
             .iter()
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
@@ -262,11 +307,15 @@ pub fn all_tools_with_runtime(
             let trimmed_value = value.trim();
             (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
         });
-        tools.push(Box::new(DelegateTool::new(
-            delegate_agents,
-            delegate_fallback_credential,
-            security.clone(),
-        )));
+        tools.push(Box::new(
+            DelegateTool::new(
+                delegate_agents,
+                delegate_fallback_credential,
+                security.clone(),
+            )
+            .with_parent_tools(parent_tools)
+            .with_task_manager(task_manager),
+        ));
     }
 
     tools
