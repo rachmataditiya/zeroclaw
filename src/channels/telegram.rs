@@ -1737,6 +1737,9 @@ Ensure only one `zeroclaw` process is using this bot token."
                 continue;
             }
 
+            // Refresh health heartbeat after each successful poll cycle.
+            crate::health::mark_component_ok("channel:telegram");
+
             if let Some(results) = data.get("result").and_then(serde_json::Value::as_array) {
                 for update in results {
                     // Advance offset past this update
