@@ -7,14 +7,16 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
-use crate::channels::{Channel, SendMessage, WhatsAppChannel};
+use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
+use crate::channels::{build_system_prompt, Channel, SendMessage, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::providers::{self, Provider};
+use crate::observability::Observer;
+use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
-use crate::tools;
+use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
@@ -44,6 +46,110 @@ pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 /// Fallback max distinct idempotency keys retained in gateway memory.
 pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
+
+/// Maximum time for webhook agent loop processing (5 minutes).
+const WEBHOOK_AGENT_TIMEOUT_SECS: u64 = 300;
+/// Default max tool iterations for webhook agent loop.
+const WEBHOOK_MAX_TOOL_ITERATIONS: usize = 10;
+
+/// Full agent context for webhook processing — mirrors what channels build.
+/// When present, webhooks use the full tool-calling agent loop instead of `simple_chat()`.
+#[derive(Clone)]
+pub struct WebhookAgentContext {
+    pub(crate) provider: Arc<dyn Provider>,
+    pub(crate) provider_name: String,
+    pub(crate) model: String,
+    pub(crate) temperature: f64,
+    pub(crate) tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    pub(crate) memory: Arc<dyn Memory>,
+    pub(crate) system_prompt: String,
+    pub(crate) observer: Arc<dyn Observer>,
+    pub(crate) max_tool_iterations: usize,
+    pub(crate) min_relevance_score: f64,
+    pub(crate) auto_save: bool,
+}
+
+impl WebhookAgentContext {
+    /// Process a message through the full agent loop (tools, memory, multi-turn).
+    pub async fn process_message(
+        &self,
+        message: &str,
+        source: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<String> {
+        let mut history = Vec::new();
+
+        // Build system message
+        history.push(ChatMessage::system(&self.system_prompt));
+
+        // Inject source context if provided
+        if source.is_some() || metadata.is_some() {
+            use std::fmt::Write;
+            let mut context = String::new();
+            if let Some(src) = source {
+                let _ = writeln!(context, "[Source: {src}]");
+            }
+            if let Some(meta) = metadata {
+                let meta_str =
+                    serde_json::to_string_pretty(meta).unwrap_or_else(|_| format!("{meta:?}"));
+                let truncated = truncate_with_ellipsis(&meta_str, 500);
+                let _ = writeln!(context, "[Metadata: {truncated}]");
+            }
+            history.push(ChatMessage::system(&context));
+        }
+
+        // Build memory context
+        if let Ok(entries) = self.memory.recall(message, 5, None).await {
+            let relevant: Vec<_> = entries
+                .iter()
+                .filter(|e| match e.score {
+                    Some(score) => score >= self.min_relevance_score,
+                    None => true,
+                })
+                .collect();
+
+            if !relevant.is_empty() {
+                use std::fmt::Write;
+                let mut mem_context = String::from("[Memory context]\n");
+                for entry in &relevant {
+                    let _ = writeln!(mem_context, "- {}: {}", entry.key, entry.content);
+                }
+                history.push(ChatMessage::system(&mem_context));
+            }
+        }
+
+        // Add user message
+        history.push(ChatMessage::user(message));
+
+        // Auto-save incoming message
+        if self.auto_save {
+            let key = webhook_memory_key();
+            let _ = self
+                .memory
+                .store(&key, message, MemoryCategory::Conversation, None)
+                .await;
+        }
+
+        // Run full agent loop with tools
+        let response = run_tool_call_loop(
+            self.provider.as_ref(),
+            &mut history,
+            self.tools_registry.as_ref(),
+            self.observer.as_ref(),
+            &self.provider_name,
+            &self.model,
+            self.temperature,
+            true, // silent
+            None, // no approval manager
+            "webhook",
+            self.max_tool_iterations,
+            None, // no streaming delta
+        )
+        .await?;
+
+        Ok(response)
+    }
+}
 
 fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
@@ -276,6 +382,9 @@ pub struct AppState {
     pub whatsapp_app_secret: Option<Arc<str>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
+    /// Full agent context for webhook processing (tools, memory, multi-turn).
+    /// When `Some`, webhooks use the full agent loop instead of `simple_chat()`.
+    pub agent_context: Option<Arc<WebhookAgentContext>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -335,7 +444,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let _tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let tools_registry = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -349,6 +458,54 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config,
     ));
+
+    // Build full agent context for webhook processing
+    let agent_context = {
+        let skills = crate::skills::load_skills(&config.workspace_dir);
+        let tool_descs: Vec<(&str, &str)> = tools_registry
+            .iter()
+            .map(|t| (t.name(), t.description()))
+            .collect();
+        let native_tools = provider.supports_native_tools() && !tool_descs.is_empty();
+        let bootstrap_max_chars = if config.agent.compact_context {
+            Some(6000)
+        } else {
+            None
+        };
+        let mut system_prompt = build_system_prompt(
+            &config.workspace_dir,
+            &model,
+            &tool_descs,
+            &skills,
+            Some(&config.identity),
+            bootstrap_max_chars,
+            native_tools,
+        );
+        if !native_tools {
+            system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref(), false));
+        }
+
+        Arc::new(WebhookAgentContext {
+            provider: provider.clone(),
+            provider_name: config
+                .default_provider
+                .clone()
+                .unwrap_or_else(|| "openrouter".to_string()),
+            model: model.clone(),
+            temperature,
+            tools_registry: tools_registry.clone(),
+            memory: Arc::clone(&mem),
+            system_prompt,
+            observer: Arc::from(crate::observability::create_observer(&config.observability)),
+            max_tool_iterations: if config.agent.max_tool_iterations > 0 {
+                config.agent.max_tool_iterations
+            } else {
+                WEBHOOK_MAX_TOOL_ITERATIONS
+            },
+            min_relevance_score: config.memory.min_relevance_score,
+            auto_save: config.memory.auto_save,
+        })
+    };
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -477,6 +634,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
         observer,
+        agent_context: Some(agent_context),
     };
 
     // Build router with middleware
@@ -611,10 +769,22 @@ fn persist_pairing_tokens(config: &Arc<Mutex<Config>>, pairing: &PairingGuard) -
         .context("Failed to persist paired tokens to config.toml")
 }
 
-/// Webhook request body
+/// Webhook request body — extended with optional context fields (backward-compatible).
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
+    /// Event source identifier (e.g., "erp-system") — injected into agent context.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Arbitrary metadata available to the agent as context.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    /// When `true`, return `202 Accepted` immediately and process in the background.
+    #[serde(default)]
+    pub async_mode: bool,
+    /// URL to POST the result to when `async_mode` is `true`.
+    #[serde(default)]
+    pub callback_url: Option<String>,
 }
 
 /// POST /webhook — main webhook endpoint
@@ -699,15 +869,11 @@ async fn handle_webhook(
         }
     }
 
-    let message = &webhook_body.message;
-
-    if state.auto_save {
-        let key = webhook_memory_key();
-        let _ = state
-            .mem
-            .store(&key, message, MemoryCategory::Conversation, None)
-            .await;
-    }
+    let message = webhook_body.message.clone();
+    let source = webhook_body.source.clone();
+    let metadata = webhook_body.metadata.clone();
+    let async_mode = webhook_body.async_mode;
+    let callback_url = webhook_body.callback_url.clone();
 
     let provider_label = state
         .config
@@ -716,91 +882,164 @@ async fn handle_webhook(
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
     let model_label = state.model.clone();
+
+    // ── Async mode: return 202 immediately, process in background ──
+    if async_mode {
+        let task_id = Uuid::new_v4().to_string();
+        let task_id_clone = task_id.clone();
+        let state_clone = state.clone();
+
+        tokio::spawn(async move {
+            let result = run_webhook_agent(
+                &state_clone,
+                &message,
+                source.as_deref(),
+                metadata.as_ref(),
+                &provider_label,
+                &model_label,
+            )
+            .await;
+
+            // POST result to callback URL if provided
+            if let Some(ref url) = callback_url {
+                let payload = match result {
+                    Ok(ref response) => serde_json::json!({
+                        "task_id": task_id_clone,
+                        "status": "completed",
+                        "response": response,
+                        "model": model_label,
+                    }),
+                    Err(ref e) => serde_json::json!({
+                        "task_id": task_id_clone,
+                        "status": "failed",
+                        "error": providers::sanitize_api_error(&e.to_string()),
+                    }),
+                };
+
+                if let Ok(client) = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                {
+                    if let Err(e) = client.post(url).json(&payload).send().await {
+                        tracing::error!("Webhook callback POST to {url} failed: {e}");
+                    }
+                }
+            }
+        });
+
+        let body = serde_json::json!({
+            "status": "accepted",
+            "task_id": task_id,
+        });
+        return (StatusCode::ACCEPTED, Json(body));
+    }
+
+    // ── Synchronous mode: process and return response ──
+    match run_webhook_agent(
+        &state,
+        &message,
+        source.as_deref(),
+        metadata.as_ref(),
+        &provider_label,
+        &model_label,
+    )
+    .await
+    {
+        Ok(response) => {
+            let body = serde_json::json!({"response": response, "model": state.model});
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            let sanitized = providers::sanitize_api_error(&e.to_string());
+            tracing::error!("Webhook agent error: {sanitized}");
+            let err = serde_json::json!({"error": "LLM request failed"});
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+        }
+    }
+}
+
+/// Run the webhook agent — uses full agent loop if context available, falls back to simple_chat.
+async fn run_webhook_agent(
+    state: &AppState,
+    message: &str,
+    source: Option<&str>,
+    metadata: Option<&serde_json::Value>,
+    provider_label: &str,
+    model_label: &str,
+) -> Result<String> {
     let started_at = Instant::now();
 
     state
         .observer
         .record_event(&crate::observability::ObserverEvent::AgentStart {
-            provider: provider_label.clone(),
-            model: model_label.clone(),
+            provider: provider_label.to_string(),
+            model: model_label.to_string(),
+        });
+
+    let result = if let Some(ref ctx) = state.agent_context {
+        // Full agent loop with tools, memory, multi-turn
+        tokio::time::timeout(
+            Duration::from_secs(WEBHOOK_AGENT_TIMEOUT_SECS),
+            ctx.process_message(message, source, metadata),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("Webhook agent timed out after {WEBHOOK_AGENT_TIMEOUT_SECS}s")
+        })?
+    } else {
+        // Fallback to simple_chat (no tools)
+        if state.auto_save {
+            let key = webhook_memory_key();
+            let _ = state
+                .mem
+                .store(&key, message, MemoryCategory::Conversation, None)
+                .await;
+        }
+
+        state
+            .observer
+            .record_event(&crate::observability::ObserverEvent::LlmRequest {
+                provider: provider_label.to_string(),
+                model: model_label.to_string(),
+                messages_count: 1,
+            });
+
+        state
+            .provider
+            .simple_chat(message, &state.model, state.temperature)
+            .await
+    };
+
+    let duration = started_at.elapsed();
+    let success = result.is_ok();
+    let error_message = result
+        .as_ref()
+        .err()
+        .map(|e| providers::sanitize_api_error(&e.to_string()));
+
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::LlmResponse {
+            provider: provider_label.to_string(),
+            model: model_label.to_string(),
+            duration,
+            success,
+            error_message,
         });
     state
         .observer
-        .record_event(&crate::observability::ObserverEvent::LlmRequest {
-            provider: provider_label.clone(),
-            model: model_label.clone(),
-            messages_count: 1,
+        .record_metric(&crate::observability::traits::ObserverMetric::RequestLatency(duration));
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::AgentEnd {
+            provider: provider_label.to_string(),
+            model: model_label.to_string(),
+            duration,
+            tokens_used: None,
+            cost_usd: None,
         });
 
-    match state
-        .provider
-        .simple_chat(message, &state.model, state.temperature)
-        .await
-    {
-        Ok(response) => {
-            let duration = started_at.elapsed();
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::LlmResponse {
-                    provider: provider_label.clone(),
-                    model: model_label.clone(),
-                    duration,
-                    success: true,
-                    error_message: None,
-                });
-            state.observer.record_metric(
-                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
-            );
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
-                    model: model_label,
-                    duration,
-                    tokens_used: None,
-                    cost_usd: None,
-                });
-
-            let body = serde_json::json!({"response": response, "model": state.model});
-            (StatusCode::OK, Json(body))
-        }
-        Err(e) => {
-            let duration = started_at.elapsed();
-            let sanitized = providers::sanitize_api_error(&e.to_string());
-
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::LlmResponse {
-                    provider: provider_label.clone(),
-                    model: model_label.clone(),
-                    duration,
-                    success: false,
-                    error_message: Some(sanitized.clone()),
-                });
-            state.observer.record_metric(
-                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
-            );
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::Error {
-                    component: "gateway".to_string(),
-                    message: sanitized.clone(),
-                });
-            state
-                .observer
-                .record_event(&crate::observability::ObserverEvent::AgentEnd {
-                    provider: provider_label,
-                    model: model_label,
-                    duration,
-                    tokens_used: None,
-                    cost_usd: None,
-                });
-
-            tracing::error!("Webhook provider error: {}", sanitized);
-            let err = serde_json::json!({"error": "LLM request failed"});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
-        }
-    }
+    result
 }
 
 /// `WhatsApp` verification query params
@@ -1035,6 +1274,7 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            agent_context: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1076,6 +1316,7 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer,
+            agent_context: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1427,6 +1668,7 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            agent_context: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1434,6 +1676,10 @@ mod tests {
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            source: None,
+            metadata: None,
+            async_mode: false,
+            callback_url: None,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -1447,6 +1693,10 @@ mod tests {
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            source: None,
+            metadata: None,
+            async_mode: false,
+            callback_url: None,
         }));
         let second = handle_webhook(State(state), test_connect_info(), headers, body)
             .await
@@ -1483,12 +1733,17 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            agent_context: None,
         };
 
         let headers = HeaderMap::new();
 
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
+            source: None,
+            metadata: None,
+            async_mode: false,
+            callback_url: None,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -1502,6 +1757,10 @@ mod tests {
 
         let body2 = Ok(Json(WebhookBody {
             message: "hello two".into(),
+            source: None,
+            metadata: None,
+            async_mode: false,
+            callback_url: None,
         }));
         let second = handle_webhook(State(state), test_connect_info(), headers, body2)
             .await
@@ -1548,6 +1807,7 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            agent_context: None,
         };
 
         let response = handle_webhook(
@@ -1556,6 +1816,10 @@ mod tests {
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                source: None,
+                metadata: None,
+                async_mode: false,
+                callback_url: None,
             })),
         )
         .await
@@ -1586,6 +1850,7 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            agent_context: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1597,6 +1862,10 @@ mod tests {
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                source: None,
+                metadata: None,
+                async_mode: false,
+                callback_url: None,
             })),
         )
         .await
@@ -1627,6 +1896,7 @@ mod tests {
             whatsapp: None,
             whatsapp_app_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            agent_context: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -1638,6 +1908,10 @@ mod tests {
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                source: None,
+                metadata: None,
+                async_mode: false,
+                callback_url: None,
             })),
         )
         .await

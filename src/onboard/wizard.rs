@@ -142,6 +142,7 @@ pub fn run_wizard() -> Result<Config> {
         agents: std::collections::HashMap::new(),
         hardware: hardware_config,
         mcp: crate::config::McpConfig::default(),
+        events: crate::config::EventsConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
     };
 
@@ -369,6 +370,7 @@ pub fn run_quick_setup(
         agents: std::collections::HashMap::new(),
         hardware: crate::config::HardwareConfig::default(),
         mcp: crate::config::McpConfig::default(),
+        events: crate::config::EventsConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
     };
 

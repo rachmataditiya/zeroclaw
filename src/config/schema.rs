@@ -146,6 +146,67 @@ pub struct Config {
     /// MCP (Model Context Protocol) server configuration.
     #[serde(default)]
     pub mcp: McpConfig,
+
+    /// Event-driven agent triggers configuration.
+    #[serde(default)]
+    pub events: EventsConfig,
+}
+
+// ── Events ──────────────────────────────────────────────────────
+
+/// Configuration for event-driven agent triggers.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EventsConfig {
+    /// External event sources (e.g., AMQP/RabbitMQ queues).
+    #[serde(default)]
+    pub sources: Vec<EventSourceConfig>,
+    /// Routing rules that map events to skills/prompt templates.
+    #[serde(default)]
+    pub routes: Vec<EventRouteConfig>,
+}
+
+/// Configuration for a single event source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventSourceConfig {
+    /// Source type (e.g., "amqp").
+    #[serde(rename = "type")]
+    pub source_type: String,
+    /// Unique name for this source.
+    pub name: String,
+    /// Connection URL (e.g., "amqp://guest:guest@localhost:5672/").
+    pub url: String,
+    /// Queue name to consume from.
+    pub queue: String,
+    /// Optional routing key filter.
+    #[serde(default)]
+    pub routing_key: Option<String>,
+    /// AMQP prefetch count (default: 1).
+    #[serde(default = "default_prefetch_count")]
+    pub prefetch_count: u16,
+}
+
+fn default_prefetch_count() -> u16 {
+    1
+}
+
+/// Routing rule that maps events from a source to a skill/prompt template.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventRouteConfig {
+    /// Event source name to match.
+    pub source: String,
+    /// Optional glob pattern for routing key matching.
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// Skill to activate (None = use all available skills).
+    #[serde(default)]
+    pub skill: Option<String>,
+    /// Prompt template with `{source}`, `{payload}` placeholders.
+    #[serde(default = "default_event_prompt_template")]
+    pub prompt_template: String,
+}
+
+fn default_event_prompt_template() -> String {
+    "Received event from {source}: {payload}".to_string()
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -2581,6 +2642,7 @@ impl Default for Config {
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             mcp: McpConfig::default(),
+            events: EventsConfig::default(),
             query_classification: QueryClassificationConfig::default(),
         }
     }
@@ -3412,6 +3474,7 @@ default_temperature = 0.7
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             mcp: McpConfig::default(),
+            events: EventsConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -3553,6 +3616,7 @@ tool_dispatcher = "xml"
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             mcp: McpConfig::default(),
+            events: EventsConfig::default(),
         };
 
         config.save().unwrap();

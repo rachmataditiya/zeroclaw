@@ -50,6 +50,7 @@ mod config;
 mod cron;
 mod daemon;
 mod doctor;
+mod events;
 mod gateway;
 mod hardware;
 mod health;

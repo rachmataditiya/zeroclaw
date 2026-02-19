@@ -152,6 +152,9 @@ probe-rs = { version = "0.30", optional = true }
 # PDF extraction for datasheet RAG (optional, enable with --features rag-pdf)
 pdf-extract = { version = "0.10", optional = true }
 
+# AMQP/RabbitMQ event source (optional, enable with --features amqp)
+lapin = { version = "2", optional = true, default-features = false }
+
 # Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
 [target.'cfg(target_os = "linux")'.dependencies]
 rppal = { version = "0.22", optional = true }
@@ -174,6 +177,8 @@ landlock = ["sandbox-landlock"]
 probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG
 rag-pdf = ["dep:pdf-extract"]
+# amqp = AMQP/RabbitMQ event source for event-driven agent triggers
+amqp = ["dep:lapin"]
 [profile.release]
 opt-level = "z"      # Optimize for size
 lto = "thin"         # Lower memory use during release builds

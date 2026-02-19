@@ -87,6 +87,23 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
+    // ── Event processor (external event sources → agent loop) ──
+    if config.events.sources.is_empty() {
+        crate::health::mark_component_ok("event_processor");
+        tracing::info!("No event sources configured; event processor not started");
+    } else {
+        let events_cfg = config.clone();
+        handles.push(spawn_component_supervisor(
+            "event_processor",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = events_cfg.clone();
+                async move { run_event_processor(cfg).await }
+            },
+        ));
+    }
+
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!("   Components: gateway, channels, heartbeat, scheduler");
@@ -206,6 +223,156 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             }
         }
     }
+}
+
+async fn run_event_processor(config: Config) -> Result<()> {
+    let observer: std::sync::Arc<dyn crate::observability::Observer> =
+        std::sync::Arc::from(crate::observability::create_observer(&config.observability));
+
+    // Build provider, memory, tools — same as gateway/channels
+    let provider: std::sync::Arc<dyn crate::providers::Provider> =
+        std::sync::Arc::from(crate::providers::create_resilient_provider_with_options(
+            config.default_provider.as_deref().unwrap_or("openrouter"),
+            config.api_key.as_deref(),
+            config.api_url.as_deref(),
+            &config.reliability,
+            &crate::providers::ProviderRuntimeOptions {
+                auth_profile_override: None,
+                zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+                secrets_encrypt: config.secrets.encrypt,
+            },
+        )?);
+
+    let mem: std::sync::Arc<dyn crate::memory::Memory> =
+        std::sync::Arc::from(crate::memory::create_memory_with_storage(
+            &config.memory,
+            Some(&config.storage.provider.config),
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        )?);
+
+    let runtime: std::sync::Arc<dyn crate::runtime::RuntimeAdapter> =
+        std::sync::Arc::from(crate::runtime::create_runtime(&config.runtime)?);
+    let security = std::sync::Arc::new(crate::security::SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+
+    let tools_registry = std::sync::Arc::new(crate::tools::all_tools_with_runtime(
+        std::sync::Arc::new(config.clone()),
+        &security,
+        runtime,
+        std::sync::Arc::clone(&mem),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+    ));
+
+    let model = config
+        .default_model
+        .clone()
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
+
+    let skills = crate::skills::load_skills(&config.workspace_dir);
+    let tool_descs: Vec<(&str, &str)> = tools_registry
+        .iter()
+        .map(|t| (t.name(), t.description()))
+        .collect();
+    let native_tools = provider.supports_native_tools() && !tool_descs.is_empty();
+    let bootstrap_max_chars = if config.agent.compact_context {
+        Some(6000)
+    } else {
+        None
+    };
+    let mut system_prompt = crate::channels::build_system_prompt(
+        &config.workspace_dir,
+        &model,
+        &tool_descs,
+        &skills,
+        Some(&config.identity),
+        bootstrap_max_chars,
+        native_tools,
+    );
+    if !native_tools {
+        system_prompt.push_str(&crate::agent::loop_::build_tool_instructions(
+            tools_registry.as_ref(),
+            false,
+        ));
+    }
+
+    let agent_context = std::sync::Arc::new(crate::gateway::WebhookAgentContext {
+        provider,
+        provider_name: config
+            .default_provider
+            .clone()
+            .unwrap_or_else(|| "openrouter".to_string()),
+        model,
+        temperature: config.default_temperature,
+        tools_registry,
+        memory: mem,
+        system_prompt,
+        observer: observer.clone(),
+        max_tool_iterations: if config.agent.max_tool_iterations > 0 {
+            config.agent.max_tool_iterations
+        } else {
+            10
+        },
+        min_relevance_score: config.memory.min_relevance_score,
+        auto_save: config.memory.auto_save,
+    });
+
+    // Build event sources from config
+    let sources = build_event_sources(&config.events);
+    let routes: Vec<crate::events::EventRoute> = config
+        .events
+        .routes
+        .iter()
+        .map(|r| crate::events::EventRoute {
+            source: r.source.clone(),
+            pattern: r.pattern.clone(),
+            skill: r.skill.clone(),
+            prompt_template: r.prompt_template.clone(),
+        })
+        .collect();
+
+    let mut processor =
+        crate::events::EventProcessor::new(sources, agent_context, routes, observer);
+
+    processor.run().await
+}
+
+fn build_event_sources(
+    config: &crate::config::EventsConfig,
+) -> Vec<Box<dyn crate::events::EventSource>> {
+    config
+        .sources
+        .iter()
+        .filter_map(|src| match src.source_type.as_str() {
+            #[cfg(feature = "amqp")]
+            "amqp" => Some(
+                Box::new(crate::events::amqp::AmqpEventSource::from_config(src))
+                    as Box<dyn crate::events::EventSource>,
+            ),
+            other => {
+                tracing::warn!("Unknown event source type: {other} (source: {})", src.name);
+                None
+            }
+        })
+        .collect()
 }
 
 fn has_supervised_channels(config: &Config) -> bool {

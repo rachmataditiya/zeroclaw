@@ -47,6 +47,7 @@ pub mod cost;
 pub mod cron;
 pub mod daemon;
 pub mod doctor;
+pub mod events;
 pub mod gateway;
 pub mod hardware;
 pub mod health;
