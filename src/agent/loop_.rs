@@ -8,6 +8,7 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use futures_util::StreamExt;
 use regex::{Regex, RegexSet};
 use std::fmt::Write;
 use std::io::Write as _;
@@ -881,27 +882,15 @@ pub(crate) async fn run_tool_call_loop(
 
         let llm_started_at = Instant::now();
 
-        // Unified path via Provider::chat so provider-specific native tool logic
-        // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
-        let request_tools = if use_native_tools {
-            Some(tool_specs.as_slice())
-        } else {
-            None
-        };
-
-        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
-            match provider
-                .chat(
-                    ChatRequest {
-                        messages: history,
-                        tools: request_tools,
-                    },
-                    model,
-                    temperature,
-                )
+        // ── Try streaming when on_delta is available and provider supports it ──
+        // Streaming sends chunks to on_delta immediately (real-time draft updates).
+        // On any error, falls through to the standard provider.chat() path below.
+        let mut streamed = false;
+        let streaming_result = if on_delta.is_some() && provider.supports_streaming() {
+            match run_streaming_iteration(provider, history, model, temperature, on_delta.as_ref())
                 .await
             {
-                Ok(resp) => {
+                Ok((buffer, parsed, calls)) => {
                     observer.record_event(&ObserverEvent::LlmResponse {
                         provider: provider_name.to_string(),
                         model: model.to_string(),
@@ -909,45 +898,90 @@ pub(crate) async fn run_tool_call_loop(
                         success: true,
                         error_message: None,
                     });
-
-                    let response_text = resp.text_or_empty().to_string();
-                    let mut calls = parse_structured_tool_calls(&resp.tool_calls);
-                    let mut parsed_text = String::new();
-
-                    if calls.is_empty() {
-                        let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                        if !fallback_text.is_empty() {
-                            parsed_text = fallback_text;
-                        }
-                        calls = fallback_calls;
-                    }
-
-                    // Preserve native tool call IDs in assistant history so role=tool
-                    // follow-up messages can reference the exact call id.
-                    let assistant_history_content = if resp.tool_calls.is_empty() {
-                        response_text.clone()
-                    } else {
-                        build_native_assistant_history(&response_text, &resp.tool_calls)
-                    };
-
-                    let native_calls = resp.tool_calls;
-                    (
-                        response_text,
-                        parsed_text,
-                        calls,
-                        assistant_history_content,
-                        native_calls,
-                    )
+                    streamed = true;
+                    Some((buffer.clone(), parsed, calls, buffer, Vec::new()))
                 }
                 Err(e) => {
-                    observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
-                        duration: llm_started_at.elapsed(),
-                        success: false,
-                        error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
-                    });
-                    return Err(e);
+                    tracing::debug!("Streaming failed, falling back to non-streaming: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // ── Unified non-streaming path via Provider::chat ──
+        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
+            if let Some(result) = streaming_result {
+                result
+            } else {
+                let request_tools = if use_native_tools {
+                    Some(tool_specs.as_slice())
+                } else {
+                    None
+                };
+
+                match provider
+                    .chat(
+                        ChatRequest {
+                            messages: history,
+                            tools: request_tools,
+                        },
+                        model,
+                        temperature,
+                    )
+                    .await
+                {
+                    Ok(resp) => {
+                        observer.record_event(&ObserverEvent::LlmResponse {
+                            provider: provider_name.to_string(),
+                            model: model.to_string(),
+                            duration: llm_started_at.elapsed(),
+                            success: true,
+                            error_message: None,
+                        });
+
+                        let response_text = resp.text_or_empty().to_string();
+                        let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                        let mut parsed_text = String::new();
+
+                        if calls.is_empty() {
+                            let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+                            if !fallback_text.is_empty() {
+                                parsed_text = fallback_text;
+                            }
+                            calls = fallback_calls;
+                        }
+
+                        // Preserve native tool call IDs in assistant history so role=tool
+                        // follow-up messages can reference the exact call id.
+                        let assistant_history_content = if resp.tool_calls.is_empty() {
+                            response_text.clone()
+                        } else {
+                            build_native_assistant_history(&response_text, &resp.tool_calls)
+                        };
+
+                        let native_calls = resp.tool_calls;
+                        (
+                            response_text,
+                            parsed_text,
+                            calls,
+                            assistant_history_content,
+                            native_calls,
+                        )
+                    }
+                    Err(e) => {
+                        observer.record_event(&ObserverEvent::LlmResponse {
+                            provider: provider_name.to_string(),
+                            model: model.to_string(),
+                            duration: llm_started_at.elapsed(),
+                            success: false,
+                            error_message: Some(crate::providers::sanitize_api_error(
+                                &e.to_string(),
+                            )),
+                        });
+                        return Err(e);
+                    }
                 }
             };
 
@@ -959,22 +993,25 @@ pub(crate) async fn run_tool_call_loop(
 
         if tool_calls.is_empty() {
             // No tool calls — this is the final response.
-            // If a streaming sender is provided, relay the text in small chunks
-            // so the channel can progressively update the draft message.
-            if let Some(ref tx) = on_delta {
-                // Split on whitespace boundaries, accumulating chunks of at least
-                // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
-                let mut chunk = String::new();
-                for word in display_text.split_inclusive(char::is_whitespace) {
-                    chunk.push_str(word);
-                    if chunk.len() >= STREAM_CHUNK_MIN_CHARS
-                        && tx.send(std::mem::take(&mut chunk)).await.is_err()
-                    {
-                        break; // receiver dropped
+            // If a streaming sender is provided and we did NOT already stream chunks,
+            // relay the text in small chunks so the channel can progressively update
+            // the draft message. When streaming was used, deltas were already sent.
+            if !streamed {
+                if let Some(ref tx) = on_delta {
+                    // Split on whitespace boundaries, accumulating chunks of at least
+                    // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
+                    let mut chunk = String::new();
+                    for word in display_text.split_inclusive(char::is_whitespace) {
+                        chunk.push_str(word);
+                        if chunk.len() >= STREAM_CHUNK_MIN_CHARS
+                            && tx.send(std::mem::take(&mut chunk)).await.is_err()
+                        {
+                            break; // receiver dropped
+                        }
                     }
-                }
-                if !chunk.is_empty() {
-                    let _ = tx.send(chunk).await;
+                    if !chunk.is_empty() {
+                        let _ = tx.send(chunk).await;
+                    }
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
@@ -1083,21 +1120,66 @@ pub(crate) async fn run_tool_call_loop(
     anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
 }
 
+/// Attempt a streaming iteration: collect chunks from the provider's stream,
+/// forwarding each delta to `on_delta` in real-time. After the stream ends,
+/// parse tool calls from the complete buffer.
+///
+/// Returns `(buffer, parsed_text, tool_calls)` on success.
+/// On any error, the caller should fall back to the non-streaming path.
+async fn run_streaming_iteration(
+    provider: &dyn Provider,
+    history: &[ChatMessage],
+    model: &str,
+    temperature: f64,
+    on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
+) -> Result<(String, String, Vec<ParsedToolCall>)> {
+    use crate::providers::traits::StreamOptions;
+
+    let options = StreamOptions::new(true);
+    let mut stream = provider.stream_chat_with_history(history, model, temperature, options);
+
+    let mut buffer = String::new();
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.map_err(|e| anyhow::anyhow!("{e}"))?;
+        if !chunk.delta.is_empty() {
+            buffer.push_str(&chunk.delta);
+            if let Some(tx) = on_delta {
+                let _ = tx.send(chunk.delta).await;
+            }
+        }
+        if chunk.is_final {
+            break;
+        }
+    }
+
+    // Parse tool calls from complete buffer (same as non-streaming)
+    let (parsed_text, calls) = parse_tool_calls(&buffer);
+    Ok((buffer, parsed_text, calls))
+}
+
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
-pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
+pub(crate) fn build_tool_instructions(
+    tools_registry: &[Box<dyn Tool>],
+    native_tools: bool,
+) -> String {
     let mut instructions = String::new();
-    instructions.push_str("\n## Tool Use Protocol\n\n");
-    instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
-    instructions.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
-    instructions.push_str(
-        "CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n",
-    );
-    instructions.push_str("Example: User says \"what's the date?\". You MUST respond with:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n\n");
-    instructions.push_str("You may use multiple tool calls in a single response. ");
-    instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
-    instructions
-        .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
+
+    if !native_tools {
+        instructions.push_str("\n## Tool Use Protocol\n\n");
+        instructions
+            .push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
+        instructions.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
+        instructions.push_str(
+            "CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n",
+        );
+        instructions.push_str("Example: User says \"what's the date?\". You MUST respond with:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n\n");
+        instructions.push_str("You may use multiple tool calls in a single response. ");
+        instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
+        instructions
+            .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
+    }
+
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools_registry {
@@ -1396,6 +1478,7 @@ pub async fn run(
     } else {
         None
     };
+    let native_tools = provider.supports_native_tools() && !tool_descs.is_empty();
     let mut system_prompt = crate::channels::build_system_prompt(
         &config.workspace_dir,
         model_name,
@@ -1403,10 +1486,13 @@ pub async fn run(
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
+        native_tools,
     );
 
     // Append structured tool-use instructions with schemas
-    system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(&tools_registry, false));
+    }
 
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = ApprovalManager::from_config(&config.autonomy);
@@ -1807,6 +1893,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         None
     };
+    let native_tools_bg = provider.supports_native_tools() && !tool_descs.is_empty();
     let mut system_prompt = crate::channels::build_system_prompt(
         &config.workspace_dir,
         &model_name,
@@ -1814,8 +1901,11 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
+        native_tools_bg,
     );
-    system_prompt.push_str(&build_tool_instructions(&tools_registry));
+    if !native_tools_bg {
+        system_prompt.push_str(&build_tool_instructions(&tools_registry, false));
+    }
 
     let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -2187,7 +2277,7 @@ Done."#;
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
-        let instructions = build_tool_instructions(&tools);
+        let instructions = build_tool_instructions(&tools, false);
 
         assert!(instructions.contains("## Tool Use Protocol"));
         assert!(instructions.contains("<tool_call>"));
@@ -2612,5 +2702,127 @@ browser_open/url>https://example.com"#;
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[0].arguments["command"], "pwd");
         assert_eq!(text, "Done");
+    }
+
+    #[test]
+    fn build_tool_instructions_native_mode_skips_xml() {
+        use crate::security::SecurityPolicy;
+        let security = Arc::new(SecurityPolicy::from_config(
+            &crate::config::AutonomyConfig::default(),
+            std::path::Path::new("/tmp"),
+        ));
+        let tools = tools::default_tools(security);
+        let instructions = build_tool_instructions(&tools, true);
+
+        assert!(
+            !instructions.contains("## Tool Use Protocol"),
+            "native mode should skip XML protocol"
+        );
+        assert!(
+            !instructions.contains("<tool_call>"),
+            "native mode should not contain tool_call tags"
+        );
+        // Should still list tool names
+        assert!(instructions.contains("shell"));
+        assert!(instructions.contains("file_read"));
+    }
+
+    #[tokio::test]
+    async fn streaming_iteration_collects_chunks() {
+        use crate::providers::traits::{StreamChunk, StreamOptions, StreamResult};
+        use futures_util::stream;
+
+        struct StreamingMock;
+        #[async_trait::async_trait]
+        impl providers::Provider for StreamingMock {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: f64,
+            ) -> anyhow::Result<String> {
+                Ok("non-streaming".into())
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _: &[ChatMessage],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamChunk>> {
+                let chunks = vec![
+                    Ok(StreamChunk::delta("Hello ")),
+                    Ok(StreamChunk::delta("world")),
+                    Ok(StreamChunk::final_chunk()),
+                ];
+                stream::iter(chunks).boxed()
+            }
+        }
+
+        let history = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+
+        let result =
+            run_streaming_iteration(&StreamingMock, &history, "model", 0.0, Some(&tx)).await;
+        assert!(result.is_ok());
+        let (buffer, _parsed, calls) = result.unwrap();
+        assert_eq!(buffer, "Hello world");
+        assert!(calls.is_empty());
+
+        // Verify deltas were sent
+        let mut received = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            received.push(chunk);
+        }
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0], "Hello ");
+        assert_eq!(received[1], "world");
+    }
+
+    #[tokio::test]
+    async fn streaming_fallback_on_error() {
+        use crate::providers::traits::{StreamChunk, StreamError, StreamOptions, StreamResult};
+        use futures_util::stream;
+
+        struct FailingStreamMock;
+        #[async_trait::async_trait]
+        impl providers::Provider for FailingStreamMock {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: f64,
+            ) -> anyhow::Result<String> {
+                Ok("fallback response".into())
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _: &[ChatMessage],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamChunk>> {
+                let chunks: Vec<StreamResult<StreamChunk>> =
+                    vec![Err(StreamError::Provider("stream error".into()))];
+                stream::iter(chunks).boxed()
+            }
+        }
+
+        let history = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
+
+        let result =
+            run_streaming_iteration(&FailingStreamMock, &history, "model", 0.0, None).await;
+        assert!(
+            result.is_err(),
+            "streaming should fail so caller can fall back"
+        );
     }
 }

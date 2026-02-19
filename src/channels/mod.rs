@@ -892,6 +892,7 @@ pub fn build_system_prompt(
     skills: &[crate::skills::Skill],
     identity_config: Option<&crate::config::IdentityConfig>,
     bootstrap_max_chars: Option<usize>,
+    native_tools: bool,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -903,13 +904,19 @@ pub fn build_system_prompt(
         for (name, desc) in tools {
             let _ = writeln!(prompt, "- **{name}**: {desc}");
         }
-        prompt.push_str("\n## Tool Use Protocol\n\n");
-        prompt.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
-        prompt.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
-        prompt.push_str("You may use multiple tool calls in a single response. ");
-        prompt.push_str("After tool execution, results appear in <tool_result> tags. ");
-        prompt
-            .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
+        if native_tools {
+            prompt.push_str("\nUse your native function-calling capability to invoke tools.\n\n");
+        } else {
+            prompt.push_str("\n## Tool Use Protocol\n\n");
+            prompt
+                .push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
+            prompt.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
+            prompt.push_str("You may use multiple tool calls in a single response. ");
+            prompt.push_str("After tool execution, results appear in <tool_result> tags. ");
+            prompt.push_str(
+                "Continue reasoning with the results until you can give a final answer.\n\n",
+            );
+        }
     }
 
     // ── 1b. Hardware (when gpio/arduino tools present) ───────────
@@ -934,12 +941,21 @@ pub fn build_system_prompt(
     }
 
     // ── 1c. Action instruction (avoid meta-summary) ───────────────
-    prompt.push_str(
-        "## Your Task\n\n\
-         When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
-         Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
-         Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
-    );
+    if native_tools {
+        prompt.push_str(
+            "## Your Task\n\n\
+             When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
+             Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
+             Instead: call tools using your native function-calling capability when you need to act. Just do what they ask.\n\n",
+        );
+    } else {
+        prompt.push_str(
+            "## Your Task\n\n\
+             When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
+             Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
+             Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
+        );
+    }
 
     // ── 2. Safety ───────────────────────────────────────────────
     prompt.push_str("## Safety\n\n");
@@ -951,12 +967,9 @@ pub fn build_system_prompt(
          - When in doubt, ask before acting externally.\n\n",
     );
 
-    // ── 3. Skills (compact list — load on-demand) ───────────────
+    // ── 3. Skills (inline prompts and tools) ───────────────────
     if !skills.is_empty() {
         prompt.push_str("## Available Skills\n\n");
-        prompt.push_str(
-            "Skills are loaded on demand. Use `read` on the skill path to get full instructions.\n\n",
-        );
         prompt.push_str("<available_skills>\n");
         for skill in skills {
             let _ = writeln!(prompt, "  <skill>");
@@ -966,13 +979,28 @@ pub fn build_system_prompt(
                 "    <description>{}</description>",
                 skill.description
             );
-            let location = skill.location.clone().unwrap_or_else(|| {
-                workspace_dir
-                    .join("skills")
-                    .join(&skill.name)
-                    .join("SKILL.md")
-            });
-            let _ = writeln!(prompt, "    <location>{}</location>", location.display());
+            if !skill.prompts.is_empty() {
+                let _ = writeln!(prompt, "    <instructions>");
+                for p in &skill.prompts {
+                    let _ = writeln!(prompt, "      {p}");
+                }
+                let _ = writeln!(prompt, "    </instructions>");
+            }
+            if !skill.tools.is_empty() {
+                let _ = writeln!(prompt, "    <tools>");
+                for tool in &skill.tools {
+                    let _ = writeln!(prompt, "      <tool>");
+                    let _ = writeln!(prompt, "        <name>{}</name>", tool.name);
+                    let _ = writeln!(
+                        prompt,
+                        "        <description>{}</description>",
+                        tool.description
+                    );
+                    let _ = writeln!(prompt, "        <kind>{}</kind>", tool.kind);
+                    let _ = writeln!(prompt, "      </tool>");
+                }
+                let _ = writeln!(prompt, "    </tools>");
+            }
             let _ = writeln!(prompt, "  </skill>");
         }
         prompt.push_str("</available_skills>\n\n");
@@ -1609,6 +1637,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     } else {
         None
     };
+    let native_tools = provider.supports_native_tools() && !tool_descs.is_empty();
     let mut system_prompt = build_system_prompt(
         &workspace,
         &model,
@@ -1616,8 +1645,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
+        native_tools,
     );
-    system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref(), false));
+    }
 
     if !skills.is_empty() {
         println!(
@@ -2730,7 +2762,7 @@ mod tests {
     fn prompt_contains_all_sections() {
         let ws = make_workspace();
         let tools = vec![("shell", "Run commands"), ("file_read", "Read files")];
-        let prompt = build_system_prompt(ws.path(), "test-model", &tools, &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "test-model", &tools, &[], None, None, false);
 
         // Section headers
         assert!(prompt.contains("## Tools"), "missing Tools section");
@@ -2754,7 +2786,7 @@ mod tests {
             ("shell", "Run commands"),
             ("memory_recall", "Search memory"),
         ];
-        let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "gpt-4o", &tools, &[], None, None, false);
 
         assert!(prompt.contains("**shell**"));
         assert!(prompt.contains("Run commands"));
@@ -2764,7 +2796,7 @@ mod tests {
     #[test]
     fn prompt_injects_safety() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None, false);
 
         assert!(prompt.contains("Do not exfiltrate private data"));
         assert!(prompt.contains("Do not run destructive commands"));
@@ -2774,7 +2806,7 @@ mod tests {
     #[test]
     fn prompt_injects_workspace_files() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None, false);
 
         assert!(prompt.contains("### SOUL.md"), "missing SOUL.md header");
         assert!(prompt.contains("Be helpful"), "missing SOUL content");
@@ -2801,7 +2833,7 @@ mod tests {
     fn prompt_missing_file_markers() {
         let tmp = TempDir::new().unwrap();
         // Empty workspace — no files at all
-        let prompt = build_system_prompt(tmp.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(tmp.path(), "model", &[], &[], None, None, false);
 
         assert!(prompt.contains("[File not found: SOUL.md]"));
         assert!(prompt.contains("[File not found: AGENTS.md]"));
@@ -2812,7 +2844,7 @@ mod tests {
     fn prompt_bootstrap_only_if_exists() {
         let ws = make_workspace();
         // No BOOTSTRAP.md — should not appear
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None, false);
         assert!(
             !prompt.contains("### BOOTSTRAP.md"),
             "BOOTSTRAP.md should not appear when missing"
@@ -2820,7 +2852,7 @@ mod tests {
 
         // Create BOOTSTRAP.md — should appear
         std::fs::write(ws.path().join("BOOTSTRAP.md"), "# Bootstrap\nFirst run.").unwrap();
-        let prompt2 = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt2 = build_system_prompt(ws.path(), "model", &[], &[], None, None, false);
         assert!(
             prompt2.contains("### BOOTSTRAP.md"),
             "BOOTSTRAP.md should appear when present"
@@ -2840,7 +2872,7 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None, false);
 
         // Daily notes should NOT be in the system prompt (on-demand via tools)
         assert!(
@@ -2856,7 +2888,7 @@ mod tests {
     #[test]
     fn prompt_runtime_metadata() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "claude-sonnet-4", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "claude-sonnet-4", &[], &[], None, None, false);
 
         assert!(prompt.contains("Model: claude-sonnet-4"));
         assert!(prompt.contains(&format!("OS: {}", std::env::consts::OS)));
@@ -2864,7 +2896,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_skills_compact_list() {
+    fn prompt_skills_inline_prompts_and_tools() {
         let ws = make_workspace();
         let skills = vec![crate::skills::Skill {
             name: "code-review".into(),
@@ -2872,23 +2904,37 @@ mod tests {
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
-            tools: vec![],
-            prompts: vec!["Long prompt content that should NOT appear in system prompt".into()],
+            tools: vec![crate::skills::SkillTool {
+                name: "lint".into(),
+                description: "Run linter".into(),
+                kind: "shell".into(),
+                command: "cargo clippy".into(),
+                args: std::collections::HashMap::new(),
+            }],
+            prompts: vec!["Review each file for common bugs".into()],
             location: None,
         }];
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None, false);
 
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
         assert!(prompt.contains("<name>code-review</name>"));
         assert!(prompt.contains("<description>Review code for bugs</description>"));
-        assert!(prompt.contains("SKILL.md</location>"));
+        // Prompts should now be inlined
         assert!(
-            prompt.contains("loaded on demand"),
-            "should mention on-demand loading"
+            prompt.contains("<instructions>"),
+            "should inline instructions"
         );
-        // Full prompt content should NOT be dumped
-        assert!(!prompt.contains("Long prompt content that should NOT appear"));
+        assert!(prompt.contains("Review each file for common bugs"));
+        // Tools should now be inlined
+        assert!(prompt.contains("<tools>"), "should inline tools");
+        assert!(prompt.contains("<name>lint</name>"));
+        assert!(prompt.contains("<kind>shell</kind>"));
+        // Should NOT mention on-demand loading
+        assert!(
+            !prompt.contains("loaded on demand"),
+            "should not mention on-demand loading"
+        );
     }
 
     #[test]
@@ -2898,7 +2944,7 @@ mod tests {
         let big_content = "x".repeat(BOOTSTRAP_MAX_CHARS + 1000);
         std::fs::write(ws.path().join("AGENTS.md"), &big_content).unwrap();
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None, false);
 
         assert!(
             prompt.contains("truncated at"),
@@ -2915,7 +2961,7 @@ mod tests {
         let ws = make_workspace();
         std::fs::write(ws.path().join("TOOLS.md"), "").unwrap();
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None, false);
 
         // Empty file should not produce a header
         assert!(
@@ -2943,7 +2989,7 @@ mod tests {
     #[test]
     fn prompt_contains_channel_capabilities() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None, false);
 
         assert!(
             prompt.contains("## Channel Capabilities"),
@@ -2962,7 +3008,7 @@ mod tests {
     #[test]
     fn prompt_workspace_path() {
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None, false);
 
         assert!(prompt.contains(&format!("Working directory: `{}`", ws.path().display())));
     }
@@ -3176,7 +3222,7 @@ mod tests {
             aieos_inline: None,
         };
 
-        let prompt = build_system_prompt(tmp.path(), "model", &[], &[], Some(&config), None);
+        let prompt = build_system_prompt(tmp.path(), "model", &[], &[], Some(&config), None, false);
 
         // Should contain AIEOS sections
         assert!(prompt.contains("## Identity"));
@@ -3217,6 +3263,7 @@ mod tests {
             &[],
             Some(&config),
             None,
+            false,
         );
 
         assert!(prompt.contains("**Name:** Claw"));
@@ -3234,7 +3281,7 @@ mod tests {
         };
 
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None, false);
 
         // Should fall back to OpenClaw format when AIEOS file is not found
         // (Error is logged to stderr with filename, not included in prompt)
@@ -3253,7 +3300,7 @@ mod tests {
         };
 
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None, false);
 
         // Should use OpenClaw format (not configured for AIEOS)
         assert!(prompt.contains("### SOUL.md"));
@@ -3271,7 +3318,7 @@ mod tests {
         };
 
         let ws = make_workspace();
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None, false);
 
         // Should use OpenClaw format even if aieos_path is set
         assert!(prompt.contains("### SOUL.md"));
@@ -3283,11 +3330,46 @@ mod tests {
     fn none_identity_config_uses_openclaw() {
         let ws = make_workspace();
         // Pass None for identity config
-        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None, false);
 
         // Should use OpenClaw format
         assert!(prompt.contains("### SOUL.md"));
         assert!(prompt.contains("Be helpful"));
+    }
+
+    #[test]
+    fn build_system_prompt_skips_xml_for_native_tools() {
+        let ws = make_workspace();
+        let tools = vec![("shell", "Run commands"), ("file_read", "Read files")];
+        let prompt = build_system_prompt(ws.path(), "model", &tools, &[], None, None, true);
+
+        // Should list tools
+        assert!(prompt.contains("**shell**"));
+        assert!(prompt.contains("**file_read**"));
+        // Should have native tools instruction
+        assert!(prompt.contains("native function-calling capability"));
+        // Should NOT have XML protocol
+        assert!(
+            !prompt.contains("## Tool Use Protocol"),
+            "native mode should skip XML protocol"
+        );
+        assert!(
+            !prompt.contains("<tool_call>"),
+            "native mode should not contain tool_call tags"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_includes_xml_for_non_native() {
+        let ws = make_workspace();
+        let tools = vec![("shell", "Run commands")];
+        let prompt = build_system_prompt(ws.path(), "model", &tools, &[], None, None, false);
+
+        // Should have XML protocol
+        assert!(prompt.contains("## Tool Use Protocol"));
+        assert!(prompt.contains("<tool_call>"));
+        // Should NOT have native tools instruction
+        assert!(!prompt.contains("native function-calling capability"));
     }
 
     #[test]

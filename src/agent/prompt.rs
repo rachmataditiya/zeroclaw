@@ -155,19 +155,36 @@ impl PromptSection for SkillsSection {
 
         let mut prompt = String::from("## Available Skills\n\n<available_skills>\n");
         for skill in ctx.skills {
-            let location = skill.location.clone().unwrap_or_else(|| {
-                ctx.workspace_dir
-                    .join("skills")
-                    .join(&skill.name)
-                    .join("SKILL.md")
-            });
+            let _ = writeln!(prompt, "  <skill>");
+            let _ = writeln!(prompt, "    <name>{}</name>", skill.name);
             let _ = writeln!(
                 prompt,
-                "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>",
-                skill.name,
-                skill.description,
-                location.display()
+                "    <description>{}</description>",
+                skill.description
             );
+            if !skill.prompts.is_empty() {
+                let _ = writeln!(prompt, "    <instructions>");
+                for p in &skill.prompts {
+                    let _ = writeln!(prompt, "      {p}");
+                }
+                let _ = writeln!(prompt, "    </instructions>");
+            }
+            if !skill.tools.is_empty() {
+                let _ = writeln!(prompt, "    <tools>");
+                for tool in &skill.tools {
+                    let _ = writeln!(prompt, "      <tool>");
+                    let _ = writeln!(prompt, "        <name>{}</name>", tool.name);
+                    let _ = writeln!(
+                        prompt,
+                        "        <description>{}</description>",
+                        tool.description
+                    );
+                    let _ = writeln!(prompt, "        <kind>{}</kind>", tool.kind);
+                    let _ = writeln!(prompt, "      </tool>");
+                }
+                let _ = writeln!(prompt, "    </tools>");
+            }
+            let _ = writeln!(prompt, "  </skill>");
         }
         prompt.push_str("</available_skills>");
         Ok(prompt)
@@ -300,5 +317,70 @@ mod tests {
         assert!(prompt.contains("## Tools"));
         assert!(prompt.contains("test_tool"));
         assert!(prompt.contains("instr"));
+    }
+
+    #[test]
+    fn skills_section_inlines_prompts_and_tools() {
+        let skills = vec![Skill {
+            name: "deploy".into(),
+            description: "Deploy to production".into(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![crate::skills::SkillTool {
+                name: "deploy_cmd".into(),
+                description: "Run deploy script".into(),
+                kind: "shell".into(),
+                command: "./deploy.sh".into(),
+                args: std::collections::HashMap::new(),
+            }],
+            prompts: vec!["Always confirm before deploying".into()],
+            location: None,
+        }];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &[],
+            skills: &skills,
+            identity_config: None,
+            dispatcher_instructions: "",
+        };
+        let section = SkillsSection;
+        let output = section.build(&ctx).unwrap();
+
+        assert!(output.contains("<name>deploy</name>"));
+        assert!(output.contains("<instructions>"));
+        assert!(output.contains("Always confirm before deploying"));
+        assert!(output.contains("<tools>"));
+        assert!(output.contains("<name>deploy_cmd</name>"));
+        assert!(output.contains("<kind>shell</kind>"));
+    }
+
+    #[test]
+    fn skills_section_empty_prompts_omits_instructions() {
+        let skills = vec![Skill {
+            name: "simple".into(),
+            description: "Simple skill".into(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec![],
+            location: None,
+        }];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &[],
+            skills: &skills,
+            identity_config: None,
+            dispatcher_instructions: "",
+        };
+        let section = SkillsSection;
+        let output = section.build(&ctx).unwrap();
+
+        assert!(output.contains("<name>simple</name>"));
+        assert!(!output.contains("<instructions>"));
+        assert!(!output.contains("<tools>"));
     }
 }
