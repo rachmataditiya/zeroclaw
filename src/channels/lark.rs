@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tokio_util::bytes::Bytes;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
+use tokio_util::bytes::Bytes;
 use uuid::Uuid;
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";

@@ -141,6 +141,7 @@ pub fn run_wizard() -> Result<Config> {
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         hardware: hardware_config,
+        mcp: crate::config::McpConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
     };
 
@@ -367,6 +368,7 @@ pub fn run_quick_setup(
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
         hardware: crate::config::HardwareConfig::default(),
+        mcp: crate::config::McpConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
     };
 
@@ -500,7 +502,6 @@ const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
 fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
-        "openrouter" => "anthropic/claude-sonnet-4.6".into(),
         "openai" => "gpt-5.2".into(),
         "openai-codex" => "gpt-5-codex".into(),
         "venice" => "zai-org-glm-5".into(),
@@ -520,7 +521,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
-        "astrai" => "anthropic/claude-sonnet-4.6".into(),
+        // openrouter, astrai, and all other providers default to this
         _ => "anthropic/claude-sonnet-4.6".into(),
     }
 }
@@ -5190,7 +5191,7 @@ mod tests {
 
         let config = Config {
             workspace_dir: tmp.path().to_path_buf(),
-            default_provider: Some("venice".to_string()),
+            default_provider: Some("unknown-provider".to_string()),
             ..Config::default()
         };
 

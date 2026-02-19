@@ -56,6 +56,7 @@ mod health;
 mod heartbeat;
 mod identity;
 mod integrations;
+mod mcp;
 mod memory;
 mod migration;
 mod observability;
@@ -74,7 +75,7 @@ mod util;
 use config::Config;
 
 // Re-export so binary's hardware/peripherals modules can use crate::HardwareCommands etc.
-pub use zeroclaw::{HardwareCommands, PeripheralCommands};
+pub use zeroclaw::{HardwareCommands, McpCommands, PeripheralCommands};
 
 /// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
@@ -241,6 +242,12 @@ enum Commands {
     Peripheral {
         #[command(subcommand)]
         peripheral_command: zeroclaw::PeripheralCommands,
+    },
+
+    /// Manage MCP (Model Context Protocol) servers
+    Mcp {
+        #[command(subcommand)]
+        mcp_command: zeroclaw::McpCommands,
     },
 }
 
@@ -749,6 +756,8 @@ async fn main() -> Result<()> {
         Commands::Peripheral { peripheral_command } => {
             peripherals::handle_command(peripheral_command.clone(), &config)
         }
+
+        Commands::Mcp { mcp_command } => mcp::handle_command(mcp_command.clone(), &config),
     }
 }
 

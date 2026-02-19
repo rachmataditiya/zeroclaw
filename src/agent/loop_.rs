@@ -1180,6 +1180,21 @@ pub async fn run(
         tools_registry.extend(peripheral_tools);
     }
 
+    // ── MCP servers (connect + extend registry) ──
+    if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        let manager = std::sync::Arc::new(crate::mcp::McpManager::new(config.mcp.clone()));
+        if let Err(e) = manager.connect_all().await {
+            tracing::warn!("MCP server connection errors: {e}");
+        }
+        tools_registry.push(Box::new(tools::McpListServersTool::new(manager.clone())));
+        tools_registry.push(Box::new(tools::McpServerToolsTool::new(manager.clone())));
+        let mcp_tools = manager.create_proxy_tools(manager.clone());
+        if !mcp_tools.is_empty() {
+            tracing::info!(count = mcp_tools.len(), "MCP proxy tools added");
+        }
+        tools_registry.extend(mcp_tools);
+    }
+
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
         .as_deref()
@@ -1626,6 +1641,21 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
+
+    // ── MCP servers (connect + extend registry) ──
+    if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        let manager = std::sync::Arc::new(crate::mcp::McpManager::new(config.mcp.clone()));
+        if let Err(e) = manager.connect_all().await {
+            tracing::warn!("MCP server connection errors: {e}");
+        }
+        tools_registry.push(Box::new(tools::McpListServersTool::new(manager.clone())));
+        tools_registry.push(Box::new(tools::McpServerToolsTool::new(manager.clone())));
+        let mcp_tools = manager.create_proxy_tools(manager.clone());
+        if !mcp_tools.is_empty() {
+            tracing::info!(count = mcp_tools.len(), "MCP proxy tools added");
+        }
+        tools_registry.extend(mcp_tools);
+    }
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config

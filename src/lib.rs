@@ -53,6 +53,7 @@ pub mod health;
 pub mod heartbeat;
 pub mod identity;
 pub mod integrations;
+pub mod mcp;
 pub mod memory;
 pub mod migration;
 pub mod observability;
@@ -223,6 +224,35 @@ pub enum HardwareCommands {
         /// Chip name (e.g. STM32F401RETx). Default: STM32F401RETx for Nucleo-F401RE
         #[arg(long, default_value = "STM32F401RETx")]
         chip: String,
+    },
+}
+
+/// MCP (Model Context Protocol) server management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum McpCommands {
+    /// List configured MCP servers
+    List,
+    /// Add a new MCP server
+    Add {
+        /// Server name
+        name: String,
+        /// Transport type (stdio, http, sse)
+        #[arg(long, default_value = "stdio")]
+        transport: String,
+        /// Command (for stdio transport)
+        #[arg(long)]
+        command: Option<String>,
+        /// Server URL (for http/sse transport)
+        #[arg(long)]
+        url: Option<String>,
+        /// Extra args for the command (stdio)
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// Remove an MCP server
+    Remove {
+        /// Server name
+        name: String,
     },
 }
 

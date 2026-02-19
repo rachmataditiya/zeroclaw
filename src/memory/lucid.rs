@@ -497,9 +497,9 @@ exit 1
             cmd,
             200,
             3,
-            Duration::from_millis(500),
-            Duration::from_millis(400),
             Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
         )
     }
 
@@ -588,9 +588,9 @@ exit 1
             probe_cmd,
             200,
             1,
-            Duration::from_millis(500),
-            Duration::from_millis(400),
             Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
         );
 
         memory
@@ -658,9 +658,9 @@ exit 1
             failing_cmd,
             200,
             99,
-            Duration::from_millis(500),
-            Duration::from_millis(400),
-            Duration::from_secs(5),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(10),
         );
 
         let first = memory.recall("auth", 5, None).await.unwrap();

@@ -31,6 +31,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "tool.browser",
     "tool.composio",
     "tool.http_request",
+    "tool.mcp",
     "tool.pushover",
     "memory.embeddings",
     "tunnel.custom",
@@ -141,6 +142,10 @@ pub struct Config {
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
+
+    /// MCP (Model Context Protocol) server configuration.
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -236,6 +241,83 @@ impl Default for HardwareConfig {
             baud_rate: default_baud_rate(),
             probe_target: None,
             workspace_datasheets: false,
+        }
+    }
+}
+
+// ── MCP Config ──────────────────────────────────────────────────
+
+/// MCP (Model Context Protocol) configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpConfig {
+    /// Whether MCP support is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default timeout in seconds for MCP requests.
+    #[serde(default = "default_mcp_timeout_secs")]
+    pub default_timeout_secs: u64,
+    /// Configured MCP servers.
+    #[serde(default)]
+    pub servers: HashMap<String, McpServerConfig>,
+}
+
+fn default_mcp_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_timeout_secs: default_mcp_timeout_secs(),
+            servers: HashMap::new(),
+        }
+    }
+}
+
+/// Configuration for a single MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    /// Transport type.
+    pub transport: McpTransportType,
+    /// Command to spawn (stdio transport only).
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Arguments for the command (stdio transport only).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables for the child process (stdio transport only).
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Server URL (http/sse transport only).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// HTTP headers (http/sse transport only).
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Request timeout override in seconds.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Auto-restart stdio process on crash.
+    #[serde(default)]
+    pub auto_restart: bool,
+}
+
+/// MCP transport type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransportType {
+    Stdio,
+    Http,
+    Sse,
+}
+
+impl std::fmt::Display for McpTransportType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stdio => write!(f, "stdio"),
+            Self::Http => write!(f, "http"),
+            Self::Sse => write!(f, "sse"),
         }
     }
 }
@@ -2429,6 +2511,7 @@ impl Default for Config {
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            mcp: McpConfig::default(),
             query_classification: QueryClassificationConfig::default(),
         }
     }
@@ -3259,6 +3342,7 @@ default_temperature = 0.7
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            mcp: McpConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -3399,6 +3483,7 @@ tool_dispatcher = "xml"
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            mcp: McpConfig::default(),
         };
 
         config.save().unwrap();

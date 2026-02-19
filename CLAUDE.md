@@ -3,6 +3,59 @@
 This file defines the default working protocol for Claude agents in this repository.
 Scope: entire repository.
 
+## 0) Build & Development Quick Reference
+
+### Core Commands
+```bash
+cargo build                                    # Debug build
+cargo build --release --locked                 # Release build (optimized for size)
+cargo build --profile release-fast --locked    # Faster release build (parallel codegen)
+cargo fmt --all -- --check                     # Check formatting
+cargo fmt --all                                # Fix formatting
+cargo clippy --all-targets -- -D warnings      # Lint
+cargo test                                     # Run all tests
+cargo test <test_name>                         # Run a single test by name
+cargo test --test <integration_test>           # Run a specific integration test file
+```
+
+### Local CI (Docker-based, recommended pre-PR)
+```bash
+./dev/ci.sh all            # Full pipeline: lint, test, build, security, docker-smoke
+./dev/ci.sh lint           # Format + Clippy
+./dev/ci.sh test           # cargo test --locked
+./dev/ci.sh build          # Release build smoke test
+./dev/ci.sh security       # cargo audit + cargo deny
+```
+
+### Quality Gate Scripts
+```bash
+./scripts/ci/rust_quality_gate.sh              # Baseline format + clippy
+./scripts/ci/rust_quality_gate.sh --strict     # Full strict clippy
+./scripts/ci/rust_strict_delta_gate.sh         # Clippy on changed lines only
+```
+
+### Git Hooks Setup
+```bash
+git config core.hooksPath .githooks            # Enable pre-push quality checks
+```
+
+### Workspace Structure
+- Root crate: `zeroclaw` (binary)
+- Subcrate: `crates/robot-kit`
+
+### Feature Flags (Cargo.toml)
+- `hardware` (default) — USB enumeration + serial port
+- `browser-native` — WebDriver automation via fantoccini
+- `peripheral-rpi` — Raspberry Pi GPIO
+- `sandbox-landlock` — Linux Landlock sandbox
+- `probe` — STM32/Nucleo memory read via probe-rs
+- `rag-pdf` — PDF extraction for RAG
+
+### Build Profiles
+- `release` — opt-level=z, lto=thin, codegen-units=1, strip=true, panic=abort
+- `release-fast` — same but codegen-units=8 (faster compile)
+- `dist` — opt-level=z, lto=fat (maximum compression for distribution)
+
 ## 1) Project Snapshot (Read First)
 
 ZeroClaw is a Rust-first autonomous agent runtime optimized for:
