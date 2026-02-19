@@ -307,6 +307,8 @@ struct NativeMessage {
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -657,11 +659,17 @@ impl OpenAiCompatibleProvider {
                                     .and_then(serde_json::Value::as_str)
                                     .map(ToString::to_string);
 
+                                let reasoning_content = value
+                                    .get("reasoning_content")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
+
                                 return NativeMessage {
                                     role: "assistant".to_string(),
                                     content,
                                     tool_call_id: None,
                                     tool_calls: Some(tool_calls),
+                                    reasoning_content,
                                 };
                             }
                         }
@@ -685,6 +693,7 @@ impl OpenAiCompatibleProvider {
                             content,
                             tool_call_id,
                             tool_calls: None,
+                            reasoning_content: None,
                         };
                     }
                 }
@@ -694,6 +703,7 @@ impl OpenAiCompatibleProvider {
                     content: Some(message.content.clone()),
                     tool_call_id: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 }
             })
             .collect()
@@ -746,6 +756,7 @@ impl OpenAiCompatibleProvider {
         ProviderChatResponse {
             text: message.content,
             tool_calls,
+            reasoning_content: message.reasoning_content,
         }
     }
 
@@ -1035,7 +1046,11 @@ impl Provider for OpenAiCompatibleProvider {
             })
             .collect::<Vec<_>>();
 
-        Ok(ProviderChatResponse { text, tool_calls })
+        Ok(ProviderChatResponse {
+            text,
+            tool_calls,
+            reasoning_content: None,
+        })
     }
 
     async fn chat(
@@ -1085,6 +1100,7 @@ impl Provider for OpenAiCompatibleProvider {
                 return Ok(ProviderChatResponse {
                     text: Some(text),
                     tool_calls: vec![],
+                    reasoning_content: None,
                 });
             }
 
@@ -1103,6 +1119,7 @@ impl Provider for OpenAiCompatibleProvider {
                         .map(|text| ProviderChatResponse {
                             text: Some(text),
                             tool_calls: vec![],
+                            reasoning_content: None,
                         })
                         .map_err(|responses_err| {
                             anyhow::anyhow!(

@@ -56,6 +56,9 @@ pub struct ChatResponse {
     pub text: Option<String>,
     /// Tool calls requested by the LLM.
     pub tool_calls: Vec<ToolCall>,
+    /// Reasoning/thinking content from the model (e.g. Moonshot Kimi K2.5).
+    /// Some providers require this to be echoed back in subsequent turns.
+    pub reasoning_content: Option<String>,
 }
 
 impl ChatResponse {
@@ -333,6 +336,7 @@ pub trait Provider: Send + Sync {
                 return Ok(ChatResponse {
                     text: Some(text),
                     tool_calls: Vec::new(),
+                    reasoning_content: None,
                 });
             }
         }
@@ -343,6 +347,7 @@ pub trait Provider: Send + Sync {
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
+            reasoning_content: None,
         })
     }
 
@@ -371,6 +376,7 @@ pub trait Provider: Send + Sync {
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
+            reasoning_content: None,
         })
     }
 
@@ -493,6 +499,7 @@ mod tests {
         let empty = ChatResponse {
             text: None,
             tool_calls: vec![],
+            reasoning_content: None,
         };
         assert!(!empty.has_tool_calls());
         assert_eq!(empty.text_or_empty(), "");
@@ -504,6 +511,7 @@ mod tests {
                 name: "shell".into(),
                 arguments: "{}".into(),
             }],
+            reasoning_content: None,
         };
         assert!(with_tools.has_tool_calls());
         assert_eq!(with_tools.text_or_empty(), "Let me check");

@@ -73,6 +73,8 @@ struct NativeMessage {
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<NativeToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -193,11 +195,16 @@ impl OpenAiProvider {
                                     .get("content")
                                     .and_then(serde_json::Value::as_str)
                                     .map(ToString::to_string);
+                                let reasoning_content = value
+                                    .get("reasoning_content")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
                                 return NativeMessage {
                                     role: "assistant".to_string(),
                                     content,
                                     tool_call_id: None,
                                     tool_calls: Some(tool_calls),
+                                    reasoning_content,
                                 };
                             }
                         }
@@ -219,6 +226,7 @@ impl OpenAiProvider {
                             content,
                             tool_call_id,
                             tool_calls: None,
+                            reasoning_content: None,
                         };
                     }
                 }
@@ -228,6 +236,7 @@ impl OpenAiProvider {
                     content: Some(m.content.clone()),
                     tool_call_id: None,
                     tool_calls: None,
+                    reasoning_content: None,
                 }
             })
             .collect()
@@ -246,7 +255,11 @@ impl OpenAiProvider {
             })
             .collect::<Vec<_>>();
 
-        ProviderChatResponse { text, tool_calls }
+        ProviderChatResponse {
+            text,
+            tool_calls,
+            reasoning_content: message.reasoning_content,
+        }
     }
 
     fn http_client(&self) -> Client {
