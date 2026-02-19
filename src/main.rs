@@ -757,7 +757,7 @@ async fn main() -> Result<()> {
             peripherals::handle_command(peripheral_command.clone(), &config)
         }
 
-        Commands::Mcp { mcp_command } => mcp::handle_command(mcp_command.clone(), &config),
+        Commands::Mcp { mcp_command } => mcp::handle_command(mcp_command.clone(), &config).await,
     }
 }
 

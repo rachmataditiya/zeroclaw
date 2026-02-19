@@ -1195,6 +1195,23 @@ pub async fn run(
         tools_registry.extend(mcp_tools);
     }
 
+    // Collect MCP tool descriptions into owned storage so they can be
+    // borrowed into `tool_descs` alongside the static entries.
+    let mcp_tool_desc_storage: Vec<(String, String)> = if config.mcp.enabled {
+        tools_registry
+            .iter()
+            .filter(|t| {
+                let name = t.name();
+                name.starts_with("mcp__")
+                    || name == "mcp_list_servers"
+                    || name == "mcp_server_tools"
+            })
+            .map(|t| (t.name().to_string(), t.description().to_string()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
         .as_deref()
@@ -1345,6 +1362,10 @@ pub async fn run(
             "hardware_capabilities",
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
+    }
+    // Append MCP tool descriptions (borrowed from owned storage above).
+    for (name, desc) in &mcp_tool_desc_storage {
+        tool_descs.push((name.as_str(), desc.as_str()));
     }
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -1657,6 +1678,23 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         tools_registry.extend(mcp_tools);
     }
 
+    // Collect MCP tool descriptions into owned storage so they can be
+    // borrowed into `tool_descs` alongside the static entries.
+    let mcp_tool_desc_storage: Vec<(String, String)> = if config.mcp.enabled {
+        tools_registry
+            .iter()
+            .filter(|t| {
+                let name = t.name();
+                name.starts_with("mcp__")
+                    || name == "mcp_list_servers"
+                    || name == "mcp_server_tools"
+            })
+            .map(|t| (t.name().to_string(), t.description().to_string()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
         .default_model
@@ -1729,6 +1767,10 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
             "hardware_capabilities",
             "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
         ));
+    }
+    // Append MCP tool descriptions (borrowed from owned storage above).
+    for (name, desc) in &mcp_tool_desc_storage {
+        tool_descs.push((name.as_str(), desc.as_str()));
     }
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)

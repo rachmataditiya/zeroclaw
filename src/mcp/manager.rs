@@ -140,6 +140,43 @@ impl McpManager {
         Some(client.cached_tools().await)
     }
 
+    /// Get server capabilities for a specific server.
+    pub async fn server_capabilities(
+        &self,
+        name: &str,
+    ) -> Option<crate::mcp::types::ServerCapabilities> {
+        let clients = self.clients.lock().await;
+        let client = clients.get(name)?;
+        client.server_capabilities().await
+    }
+
+    /// List resources from a specific server (returns empty vec if unsupported).
+    pub async fn server_resources(
+        &self,
+        name: &str,
+    ) -> Vec<crate::mcp::types::McpResourceDefinition> {
+        let client = {
+            let clients = self.clients.lock().await;
+            clients.get(name).cloned()
+        };
+        let Some(client) = client else {
+            return Vec::new();
+        };
+        client.list_resources().await.unwrap_or_default()
+    }
+
+    /// List prompts from a specific server (returns empty vec if unsupported).
+    pub async fn server_prompts(&self, name: &str) -> Vec<crate::mcp::types::McpPromptDefinition> {
+        let client = {
+            let clients = self.clients.lock().await;
+            clients.get(name).cloned()
+        };
+        let Some(client) = client else {
+            return Vec::new();
+        };
+        client.list_prompts().await.unwrap_or_default()
+    }
+
     /// Call a tool on a specific server.
     pub async fn call_tool(
         &self,

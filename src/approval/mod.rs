@@ -93,8 +93,13 @@ impl ApprovalManager {
             return true;
         }
 
-        // auto_approve skips the prompt.
-        if self.auto_approve.contains(tool_name) {
+        // auto_approve skips the prompt (exact match or trailing-* prefix match).
+        if self.auto_approve.contains(tool_name)
+            || self
+                .auto_approve
+                .iter()
+                .any(|pat| pat.ends_with('*') && tool_name.starts_with(&pat[..pat.len() - 1]))
+        {
             return false;
         }
 
@@ -422,5 +427,35 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ApprovalRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tool_name, "shell");
+    }
+
+    // ── wildcard auto_approve ───────────────────────────────
+
+    #[test]
+    fn auto_approve_wildcard_matches_prefix() {
+        let config = AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            auto_approve: vec!["mcp__*".into()],
+            ..AutonomyConfig::default()
+        };
+        let mgr = ApprovalManager::from_config(&config);
+        assert!(!mgr.needs_approval("mcp__odoo__list_partners"));
+        assert!(!mgr.needs_approval("mcp__github__search"));
+        // Non-matching tools still require approval.
+        assert!(mgr.needs_approval("shell"));
+        assert!(mgr.needs_approval("file_write"));
+    }
+
+    #[test]
+    fn auto_approve_wildcard_does_not_match_partial() {
+        let config = AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            auto_approve: vec!["mcp__odoo_*".into()],
+            ..AutonomyConfig::default()
+        };
+        let mgr = ApprovalManager::from_config(&config);
+        assert!(!mgr.needs_approval("mcp__odoo_list_partners"));
+        // Different server prefix should still require approval.
+        assert!(mgr.needs_approval("mcp__github__search"));
     }
 }

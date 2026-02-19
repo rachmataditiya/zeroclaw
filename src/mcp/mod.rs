@@ -16,7 +16,7 @@ use crate::config::Config;
 use anyhow::Result;
 
 /// Handle `zeroclaw mcp` subcommands.
-pub fn handle_command(cmd: crate::McpCommands, config: &Config) -> Result<()> {
+pub async fn handle_command(cmd: crate::McpCommands, config: &Config) -> Result<()> {
     match cmd {
         crate::McpCommands::List => {
             if config.mcp.servers.is_empty() {
@@ -109,6 +109,147 @@ pub fn handle_command(cmd: crate::McpCommands, config: &Config) -> Result<()> {
             cfg.save()?;
             println!("Removed MCP server '{name}'. Restart agent to apply.");
         }
+        crate::McpCommands::Status { server } => {
+            handle_status(config, server.as_deref()).await?;
+        }
     }
     Ok(())
+}
+
+/// Probe configured MCP servers and display connectivity status.
+async fn handle_status(config: &Config, filter_server: Option<&str>) -> Result<()> {
+    if config.mcp.servers.is_empty() {
+        println!("No MCP servers configured.");
+        println!("Add one with: zeroclaw mcp add <name> --command <cmd>");
+        return Ok(());
+    }
+
+    if !config.mcp.enabled {
+        println!("MCP is configured but not enabled. Set mcp.enabled = true in config.toml");
+        println!();
+    }
+
+    // If filtering by server name, verify it exists.
+    if let Some(name) = filter_server {
+        if !config.mcp.servers.contains_key(name) {
+            anyhow::bail!("MCP server '{name}' not found in config. Use `zeroclaw mcp list` to see configured servers.");
+        }
+    }
+
+    let manager = McpManager::new(config.mcp.clone());
+
+    println!("Checking MCP server connectivity...");
+    println!();
+
+    let servers: Vec<(&String, &crate::config::McpServerConfig)> = config
+        .mcp
+        .servers
+        .iter()
+        .filter(|(name, _)| filter_server.is_none() || filter_server == Some(name.as_str()))
+        .collect();
+
+    let mut connected_count = 0usize;
+
+    for (name, server_config) in &servers {
+        let transport_detail = match &server_config.transport {
+            crate::config::McpTransportType::Stdio => {
+                format!(
+                    "{} {}",
+                    server_config.command.as_deref().unwrap_or("(no command)"),
+                    server_config.args.join(" ")
+                )
+            }
+            crate::config::McpTransportType::Http | crate::config::McpTransportType::Sse => {
+                server_config
+                    .url
+                    .as_deref()
+                    .unwrap_or("(no url)")
+                    .to_string()
+            }
+        };
+
+        println!(
+            "  {name}  ({})  {transport_detail}",
+            server_config.transport
+        );
+
+        match manager.connect_server(name).await {
+            Ok(()) => {
+                connected_count += 1;
+                print_server_details(&manager, name).await;
+            }
+            Err(e) => {
+                println!("    status: error");
+                println!("    error:  {e}");
+            }
+        }
+        println!();
+    }
+
+    // Print summary.
+    let total = servers.len();
+    println!("{connected_count}/{total} servers connected.");
+
+    // Clean up.
+    let _ = manager.shutdown().await;
+
+    Ok(())
+}
+
+/// Print detailed status for a connected server.
+async fn print_server_details(manager: &McpManager, name: &str) {
+    println!("    status: connected");
+
+    // Show advertised capabilities.
+    let caps = manager.server_capabilities(name).await;
+    if let Some(caps) = caps {
+        let mut cap_list = Vec::new();
+        if caps.tools.is_some() {
+            cap_list.push("tools");
+        }
+        if caps.resources.is_some() {
+            cap_list.push("resources");
+        }
+        if caps.prompts.is_some() {
+            cap_list.push("prompts");
+        }
+        if caps.logging.is_some() {
+            cap_list.push("logging");
+        }
+        if cap_list.is_empty() {
+            println!("    capabilities: (none advertised)");
+        } else {
+            println!("    capabilities: {}", cap_list.join(", "));
+        }
+
+        // Tools
+        if caps.tools.is_some() {
+            let tools = manager.server_tools(name).await.unwrap_or_default();
+            println!("    tools: {}", tools.len());
+            for tool in &tools {
+                let desc = tool.description.as_deref().unwrap_or("(no description)");
+                println!("      - {}: {desc}", tool.name);
+            }
+        }
+
+        // Resources
+        if caps.resources.is_some() {
+            let resources = manager.server_resources(name).await;
+            println!("    resources: {}", resources.len());
+            for res in &resources {
+                let desc = res.description.as_deref().unwrap_or(&res.uri);
+                println!("      - {}: {desc}", res.name);
+            }
+        }
+
+        // Prompts
+        if caps.prompts.is_some() {
+            let prompts = manager.server_prompts(name).await;
+            println!("    prompts: {}", prompts.len());
+            for prompt in &prompts {
+                let desc = prompt.description.as_deref().unwrap_or("(no description)");
+                println!("      - {}: {desc}", prompt.name);
+            }
+        }
+    }
 }

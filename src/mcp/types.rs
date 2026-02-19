@@ -112,11 +112,33 @@ impl McpContent {
 pub struct ServerCapabilities {
     #[serde(default)]
     pub tools: Option<ToolsCapability>,
+    #[serde(default)]
+    pub resources: Option<ResourcesCapability>,
+    #[serde(default)]
+    pub prompts: Option<PromptsCapability>,
+    #[serde(default)]
+    pub logging: Option<serde_json::Value>,
 }
 
 /// Tools capability.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolsCapability {
+    #[serde(default, rename = "listChanged")]
+    pub list_changed: bool,
+}
+
+/// Resources capability.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResourcesCapability {
+    #[serde(default)]
+    pub subscribe: bool,
+    #[serde(default, rename = "listChanged")]
+    pub list_changed: bool,
+}
+
+/// Prompts capability.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PromptsCapability {
     #[serde(default, rename = "listChanged")]
     pub list_changed: bool,
 }
@@ -196,6 +218,53 @@ pub const MCP_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolsListResult {
     pub tools: Vec<McpToolDefinition>,
+}
+
+// ── MCP resource types ─────────────────────────────────────────
+
+/// MCP resource definition from `resources/list` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpResourceDefinition {
+    pub uri: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default, rename = "mimeType")]
+    pub mime_type: Option<String>,
+}
+
+/// Resources/list response wrapper.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourcesListResult {
+    pub resources: Vec<McpResourceDefinition>,
+}
+
+// ── MCP prompt types ───────────────────────────────────────────
+
+/// MCP prompt definition from `prompts/list` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub arguments: Vec<McpPromptArgument>,
+}
+
+/// Argument for an MCP prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptArgument {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// Prompts/list response wrapper.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptsListResult {
+    pub prompts: Vec<McpPromptDefinition>,
 }
 
 #[cfg(test)]

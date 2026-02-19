@@ -3,7 +3,8 @@
 use crate::mcp::transport::McpTransport;
 use crate::mcp::types::{
     ClientCapabilities, ClientInfo, InitializeParams, InitializeResult, JsonRpcRequest,
-    McpCallToolResult, McpServerStatus, McpToolDefinition, ServerCapabilities, ToolsListResult,
+    McpCallToolResult, McpPromptDefinition, McpResourceDefinition, McpServerStatus,
+    McpToolDefinition, PromptsListResult, ResourcesListResult, ServerCapabilities, ToolsListResult,
     MCP_CLIENT_NAME, MCP_CLIENT_VERSION, MCP_PROTOCOL_VERSION,
 };
 use anyhow::{bail, Context, Result};
@@ -156,6 +157,53 @@ impl McpClient {
             serde_json::from_value(result_value).context("Failed to parse tools/call result")?;
 
         Ok(call_result)
+    }
+
+    /// Call `resources/list` to discover available resources.
+    pub async fn list_resources(&self) -> Result<Vec<McpResourceDefinition>> {
+        let req = JsonRpcRequest::new(self.next_id(), "resources/list", None);
+        let resp = self
+            .transport
+            .send_request(&req)
+            .await
+            .context("MCP resources/list request failed")?;
+
+        if let Some(err) = resp.error {
+            bail!("MCP resources/list error: {err}");
+        }
+
+        let result_value = resp
+            .result
+            .context("MCP resources/list returned no result")?;
+        let list_result: ResourcesListResult = serde_json::from_value(result_value)
+            .context("Failed to parse resources/list result")?;
+
+        Ok(list_result.resources)
+    }
+
+    /// Call `prompts/list` to discover available prompts.
+    pub async fn list_prompts(&self) -> Result<Vec<McpPromptDefinition>> {
+        let req = JsonRpcRequest::new(self.next_id(), "prompts/list", None);
+        let resp = self
+            .transport
+            .send_request(&req)
+            .await
+            .context("MCP prompts/list request failed")?;
+
+        if let Some(err) = resp.error {
+            bail!("MCP prompts/list error: {err}");
+        }
+
+        let result_value = resp.result.context("MCP prompts/list returned no result")?;
+        let list_result: PromptsListResult =
+            serde_json::from_value(result_value).context("Failed to parse prompts/list result")?;
+
+        Ok(list_result.prompts)
+    }
+
+    /// Get server capabilities (from last `initialize()` call).
+    pub async fn server_capabilities(&self) -> Option<ServerCapabilities> {
+        self.server_capabilities.lock().await.clone()
     }
 
     /// Get current connection status.

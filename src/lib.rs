@@ -254,6 +254,12 @@ pub enum McpCommands {
         /// Server name
         name: String,
     },
+    /// Check connectivity and status of configured MCP servers
+    Status {
+        /// Check a specific server (all if omitted)
+        #[arg(long)]
+        server: Option<String>,
+    },
 }
 
 /// Peripheral (hardware) management subcommands
