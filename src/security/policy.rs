@@ -356,6 +356,11 @@ impl SecurityPolicy {
             return false;
         }
 
+        // Full autonomy bypasses the command allowlist.
+        if self.autonomy == AutonomyLevel::Full {
+            return true;
+        }
+
         // Block subshell/expansion operators — these allow hiding arbitrary
         // commands inside an allowed command (e.g. `echo $(rm -rf /)`)
         if command.contains('`')
@@ -711,10 +716,13 @@ mod tests {
     }
 
     #[test]
-    fn full_autonomy_still_uses_allowlist() {
+    fn full_autonomy_bypasses_allowlist() {
         let p = full_policy();
         assert!(p.is_command_allowed("ls"));
-        assert!(!p.is_command_allowed("rm -rf /"));
+        assert!(p.is_command_allowed("docker ps"));
+        assert!(p.is_command_allowed("rm -rf /tmp/test"));
+        // Note: dangerous commands are still caught by validate_command_execution()
+        // via block_high_risk_commands, which is a separate policy gate.
     }
 
     #[test]
