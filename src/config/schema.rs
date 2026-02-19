@@ -1591,6 +1591,7 @@ impl Default for ObservabilityConfig {
 // ── Autonomy / Security ──────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AutonomyConfig {
     pub level: AutonomyLevel,
     pub workspace_only: bool,
@@ -1600,28 +1601,16 @@ pub struct AutonomyConfig {
     pub max_cost_per_day_cents: u32,
 
     /// Require explicit approval for medium-risk shell commands.
-    #[serde(default = "default_true")]
     pub require_approval_for_medium_risk: bool,
 
     /// Block high-risk shell commands even if allowlisted.
-    #[serde(default = "default_true")]
     pub block_high_risk_commands: bool,
 
     /// Tools that never require approval (e.g. read-only tools).
-    #[serde(default = "default_auto_approve")]
     pub auto_approve: Vec<String>,
 
     /// Tools that always require interactive approval, even after "Always".
-    #[serde(default = "default_always_ask")]
     pub always_ask: Vec<String>,
-}
-
-fn default_auto_approve() -> Vec<String> {
-    vec!["file_read".into(), "memory_recall".into()]
-}
-
-fn default_always_ask() -> Vec<String> {
-    vec![]
 }
 
 impl Default for AutonomyConfig {
@@ -1667,8 +1656,8 @@ impl Default for AutonomyConfig {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
-            auto_approve: default_auto_approve(),
-            always_ask: default_always_ask(),
+            auto_approve: vec!["file_read".into(), "memory_recall".into()],
+            always_ask: vec![],
         }
     }
 }
