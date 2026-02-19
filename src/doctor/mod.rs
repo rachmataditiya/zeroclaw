@@ -939,6 +939,10 @@ mod tests {
                 api_key: None,
                 temperature: None,
                 max_depth: 3,
+                mode: None,
+                allowed_tools: vec![],
+                max_iterations: None,
+                background: false,
             },
         );
         config.agents.insert(
@@ -950,6 +954,10 @@ mod tests {
                 api_key: None,
                 temperature: None,
                 max_depth: 3,
+                mode: None,
+                allowed_tools: vec![],
+                max_iterations: None,
+                background: false,
             },
         );
 

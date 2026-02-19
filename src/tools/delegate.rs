@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::DelegateAgentConfig;
-use crate::providers::{self, Provider};
+use crate::providers::{self, ChatMessage, ChatRequest, ChatResponse, Provider};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -12,10 +12,17 @@ use std::time::Duration;
 /// Default timeout for sub-agent provider calls.
 const DELEGATE_TIMEOUT_SECS: u64 = 120;
 
+/// Default max iterations for full-mode sub-agents.
+const DEFAULT_SUB_AGENT_MAX_ITERATIONS: usize = 10;
+
 /// Tool that delegates a subtask to a named agent with a different
 /// provider/model configuration. Enables multi-agent workflows where
 /// a primary agent can hand off specialized work (research, coding,
 /// summarization) to purpose-built sub-agents.
+///
+/// Supports two modes:
+/// - `"simple"` (default): Single LLM call, synchronous response.
+/// - `"full"`: Runs a tool-use loop where the sub-agent can use tools.
 pub struct DelegateTool {
     agents: Arc<HashMap<String, DelegateAgentConfig>>,
     security: Arc<SecurityPolicy>,
@@ -23,6 +30,8 @@ pub struct DelegateTool {
     fallback_credential: Option<String>,
     /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
+    /// Parent's tool registry (shared for "full" mode sub-agents).
+    parent_tools: Option<Arc<Vec<Box<dyn Tool>>>>,
 }
 
 impl DelegateTool {
@@ -36,12 +45,11 @@ impl DelegateTool {
             security,
             fallback_credential,
             depth: 0,
+            parent_tools: None,
         }
     }
 
     /// Create a DelegateTool for a sub-agent (with incremented depth).
-    /// When sub-agents eventually get their own tool registry, construct
-    /// their DelegateTool via this method with `depth: parent.depth + 1`.
     pub fn with_depth(
         agents: HashMap<String, DelegateAgentConfig>,
         fallback_credential: Option<String>,
@@ -53,7 +61,14 @@ impl DelegateTool {
             security,
             fallback_credential,
             depth,
+            parent_tools: None,
         }
+    }
+
+    /// Set the parent tool registry for "full" mode sub-agents.
+    pub fn with_parent_tools(mut self, tools: Arc<Vec<Box<dyn Tool>>>) -> Self {
+        self.parent_tools = Some(tools);
+        self
     }
 }
 
@@ -65,8 +80,8 @@ impl Tool for DelegateTool {
 
     fn description(&self) -> &str {
         "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model \
-         (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single \
-         prompt and returns its response."
+         (e.g. fast summarization, deep reasoning, code generation). Supports simple (single call) \
+         and full (multi-turn with tools) modes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -95,6 +110,11 @@ impl Tool for DelegateTool {
                 "context": {
                     "type": "string",
                     "description": "Optional context to prepend (e.g. relevant code, prior findings)"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["simple", "full"],
+                    "description": "Delegation mode: 'simple' (single LLM call) or 'full' (multi-turn with tools). Defaults to agent config."
                 }
             },
             "required": ["agent", "prompt"]
@@ -214,7 +234,26 @@ impl Tool for DelegateTool {
 
         let temperature = agent_config.temperature.unwrap_or(0.7);
 
-        // Wrap the provider call in a timeout to prevent indefinite blocking
+        // Determine delegation mode (args override config)
+        let mode = args
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .or(agent_config.mode.as_deref())
+            .unwrap_or("simple");
+
+        if mode == "full" {
+            return self
+                .execute_full_mode(
+                    agent_name,
+                    agent_config,
+                    provider,
+                    &full_prompt,
+                    temperature,
+                )
+                .await;
+        }
+
+        // Simple mode: single LLM call
         let result = tokio::time::timeout(
             Duration::from_secs(DELEGATE_TIMEOUT_SECS),
             provider.chat_with_system(
@@ -265,6 +304,194 @@ impl Tool for DelegateTool {
     }
 }
 
+impl DelegateTool {
+    /// Execute in "full" mode: run a multi-turn tool-use loop for the sub-agent.
+    async fn execute_full_mode(
+        &self,
+        agent_name: &str,
+        agent_config: &DelegateAgentConfig,
+        provider: Box<dyn Provider>,
+        full_prompt: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ToolResult> {
+        let max_iterations = agent_config
+            .max_iterations
+            .unwrap_or(DEFAULT_SUB_AGENT_MAX_ITERATIONS);
+
+        // Build sub-agent tool registry from parent tools
+        let sub_tools: Vec<&dyn Tool> = match &self.parent_tools {
+            Some(tools) => {
+                let allowed = &agent_config.allowed_tools;
+                if allowed.is_empty() {
+                    tools.iter().map(|t| t.as_ref()).collect()
+                } else {
+                    tools
+                        .iter()
+                        .filter(|t| allowed.contains(&t.name().to_string()))
+                        .map(|t| t.as_ref())
+                        .collect()
+                }
+            }
+            None => vec![],
+        };
+
+        // Build tool specs for the provider
+        let tool_specs: Vec<crate::tools::ToolSpec> = sub_tools.iter().map(|t| t.spec()).collect();
+        let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
+
+        // Build system prompt
+        let mut system = agent_config.system_prompt.clone().unwrap_or_default();
+
+        if !use_native_tools && !sub_tools.is_empty() {
+            let tool_instructions = build_sub_agent_tool_instructions(&sub_tools);
+            system = format!("{system}\n\n{tool_instructions}");
+        }
+
+        // Initialize conversation history
+        let mut history = Vec::new();
+        if !system.is_empty() {
+            history.push(ChatMessage::system(&system));
+        }
+        history.push(ChatMessage::user(full_prompt));
+
+        let mut final_response = String::new();
+
+        for _iteration in 0..max_iterations {
+            let request = ChatRequest {
+                messages: &history,
+                tools: if use_native_tools {
+                    Some(&tool_specs)
+                } else {
+                    None
+                },
+            };
+
+            let response: ChatResponse = match tokio::time::timeout(
+                Duration::from_secs(DELEGATE_TIMEOUT_SECS),
+                provider.chat(request, &agent_config.model, temperature),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: final_response,
+                        error: Some(format!("Sub-agent '{agent_name}' provider error: {e}")),
+                    });
+                }
+                Err(_) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: final_response,
+                        error: Some(format!(
+                            "Sub-agent '{agent_name}' timed out after {DELEGATE_TIMEOUT_SECS}s"
+                        )),
+                    });
+                }
+            };
+
+            let response_text = response.text.clone().unwrap_or_default();
+
+            // Check for tool calls
+            if response.tool_calls.is_empty() {
+                final_response = response_text;
+                break;
+            }
+
+            // Add assistant message with tool calls to history
+            history.push(ChatMessage::assistant(&response_text));
+
+            // Execute each tool call
+            for tool_call in &response.tool_calls {
+                let tool = sub_tools.iter().find(|t| t.name() == tool_call.name);
+
+                // Parse arguments from JSON string
+                let args: serde_json::Value =
+                    serde_json::from_str(&tool_call.arguments).unwrap_or(json!({}));
+
+                let tool_result = if let Some(tool) = tool {
+                    match tool.execute(args).await {
+                        Ok(r) => r,
+                        Err(e) => ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("Tool '{}' error: {e}", tool_call.name)),
+                        },
+                    }
+                } else {
+                    ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Unknown tool: {}", tool_call.name)),
+                    }
+                };
+
+                let result_text = if tool_result.success {
+                    tool_result.output
+                } else {
+                    format!(
+                        "Error: {}",
+                        tool_result.error.unwrap_or_else(|| "unknown error".into())
+                    )
+                };
+
+                // For native tool support, use tool message with call ID;
+                // otherwise, inject as user message with XML tags.
+                if use_native_tools {
+                    history.push(ChatMessage::tool(
+                        json!({
+                            "tool_call_id": tool_call.id,
+                            "content": result_text,
+                        })
+                        .to_string(),
+                    ));
+                } else {
+                    history.push(ChatMessage::user(format!(
+                        "<tool_result name=\"{}\">{}</tool_result>",
+                        tool_call.name, result_text
+                    )));
+                }
+            }
+
+            final_response = response_text;
+        }
+
+        if final_response.trim().is_empty() {
+            final_response = "[Empty response]".to_string();
+        }
+
+        Ok(ToolResult {
+            success: true,
+            output: format!(
+                "[Agent '{agent_name}' ({provider}/{model}, mode=full)]\n{final_response}",
+                provider = agent_config.provider,
+                model = agent_config.model
+            ),
+            error: None,
+        })
+    }
+}
+
+/// Build tool instructions text for non-native-tool providers.
+fn build_sub_agent_tool_instructions(tools: &[&dyn Tool]) -> String {
+    use std::fmt::Write;
+    let mut instructions = String::from("# Available Tools\n\n");
+    for tool in tools {
+        let _ = write!(
+            instructions,
+            "## {}\n{}\nParameters: {}\n\n",
+            tool.name(),
+            tool.description(),
+            serde_json::to_string_pretty(&tool.parameters_schema()).unwrap_or_default()
+        );
+    }
+    instructions.push_str(
+        "To use a tool, respond with:\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {...}}\n</tool_call>\n",
+    );
+    instructions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +512,10 @@ mod tests {
                 api_key: None,
                 temperature: Some(0.3),
                 max_depth: 3,
+                mode: None,
+                allowed_tools: vec![],
+                max_iterations: None,
+                background: false,
             },
         );
         agents.insert(
@@ -296,6 +527,10 @@ mod tests {
                 api_key: Some("delegate-test-credential".to_string()),
                 temperature: None,
                 max_depth: 2,
+                mode: None,
+                allowed_tools: vec![],
+                max_iterations: None,
+                background: false,
             },
         );
         agents
@@ -403,6 +638,10 @@ mod tests {
                 api_key: None,
                 temperature: None,
                 max_depth: 3,
+                mode: None,
+                allowed_tools: vec![],
+                max_iterations: None,
+                background: false,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -506,6 +745,10 @@ mod tests {
                 api_key: None,
                 temperature: None,
                 max_depth: 3,
+                mode: None,
+                allowed_tools: vec![],
+                max_iterations: None,
+                background: false,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -538,6 +781,10 @@ mod tests {
                 api_key: None,
                 temperature: None,
                 max_depth: 3,
+                mode: None,
+                allowed_tools: vec![],
+                max_iterations: None,
+                background: false,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());

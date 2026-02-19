@@ -98,6 +98,21 @@ console = "0.16"
 # Hardware discovery (device path globbing)
 glob = "0.3"
 
+# Directory traversal (file_list, file_search tools)
+walkdir = "2"
+
+# URL parsing (web_fetch tool)
+url = "2"
+
+# HTML to text conversion (web_fetch tool)
+html2text = "0.14"
+
+# PTY allocation for interactive processes (process tool)
+portable-pty = "0.8"
+
+# Shell command parsing (process tool pipe-based spawn)
+shell-words = "1"
+
 # Discord WebSocket gateway
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }

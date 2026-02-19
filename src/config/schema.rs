@@ -169,6 +169,18 @@ pub struct DelegateAgentConfig {
     /// Max recursion depth for nested delegation
     #[serde(default = "default_max_depth")]
     pub max_depth: u32,
+    /// Delegation mode: "simple" (single LLM call) or "full" (agent loop with tools)
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Allowed tools for "full" mode sub-agents (empty = all parent tools)
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// Max tool iterations for "full" mode (default: 10)
+    #[serde(default)]
+    pub max_iterations: Option<usize>,
+    /// Run in background (return task_id immediately)
+    #[serde(default)]
+    pub background: bool,
 }
 
 fn default_max_depth() -> u32 {
@@ -1619,11 +1631,70 @@ impl Default for AutonomyConfig {
             level: AutonomyLevel::Supervised,
             workspace_only: true,
             allowed_commands: vec![
+                // VCS
                 "git".into(),
+                // Package managers
                 "npm".into(),
+                "npx".into(),
+                "yarn".into(),
+                "pnpm".into(),
                 "cargo".into(),
-                "ls".into(),
+                "pip".into(),
+                "pip3".into(),
+                "brew".into(),
+                "apt".into(),
+                "apt-get".into(),
+                "dpkg".into(),
+                "dnf".into(),
+                "yum".into(),
+                "rpm".into(),
+                "pacman".into(),
+                "zypper".into(),
+                "apk".into(),
+                // Runtimes
+                "python".into(),
+                "python3".into(),
+                "node".into(),
+                "deno".into(),
+                "bun".into(),
+                "bash".into(),
+                "sh".into(),
+                "ruby".into(),
+                // Build tools
+                "make".into(),
+                "cmake".into(),
+                "gcc".into(),
+                "g++".into(),
+                "rustc".into(),
+                "tsc".into(),
+                "go".into(),
+                // Dev/CLI tools
+                "docker".into(),
+                "docker-compose".into(),
+                "gh".into(),
+                "jq".into(),
+                "sed".into(),
+                "awk".into(),
+                "sort".into(),
+                "uniq".into(),
+                "tr".into(),
+                "cut".into(),
+                "diff".into(),
+                "patch".into(),
+                "xargs".into(),
+                "env".into(),
+                "which".into(),
+                "whereis".into(),
+                "date".into(),
+                "uname".into(),
+                "whoami".into(),
+                "mkdir".into(),
+                "touch".into(),
+                "cp".into(),
+                "mv".into(),
+                // Standard utilities
                 "cat".into(),
+                "ls".into(),
                 "grep".into(),
                 "find".into(),
                 "echo".into(),
@@ -1631,6 +1702,15 @@ impl Default for AutonomyConfig {
                 "wc".into(),
                 "head".into(),
                 "tail".into(),
+                "test".into(),
+                "true".into(),
+                "false".into(),
+                // Network tools (medium-risk, needs approval)
+                "curl".into(),
+                "wget".into(),
+                // Agent tools
+                "claude".into(),
+                "codex".into(),
             ],
             forbidden_paths: vec![
                 "/etc".into(),
@@ -1652,7 +1732,7 @@ impl Default for AutonomyConfig {
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
-            max_actions_per_hour: 20,
+            max_actions_per_hour: 100,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
@@ -3164,7 +3244,7 @@ mod tests {
         assert!(a.allowed_commands.contains(&"git".to_string()));
         assert!(a.allowed_commands.contains(&"cargo".to_string()));
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
-        assert_eq!(a.max_actions_per_hour, 20);
+        assert_eq!(a.max_actions_per_hour, 100);
         assert_eq!(a.max_cost_per_day_cents, 500);
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
@@ -3519,6 +3599,10 @@ tool_dispatcher = "xml"
                 api_key: Some("agent-credential".into()),
                 temperature: None,
                 max_depth: 3,
+                mode: None,
+                allowed_tools: vec![],
+                max_iterations: None,
+                background: false,
             },
         );
 

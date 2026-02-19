@@ -1270,7 +1270,31 @@ pub async fn run(
         ),
         (
             "file_write",
-            "Write file contents. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain.",
+            "Write file contents (full overwrite). Use when: creating new files, rewriting entire files. Prefer file_edit for targeted changes.",
+        ),
+        (
+            "file_edit",
+            "Replace specific text in a file. More token-efficient than file_write for small edits. Params: path, old_text, new_text, replace_all.",
+        ),
+        (
+            "file_list",
+            "List directory contents with optional recursive traversal and glob filtering. Use instead of shell ls/find.",
+        ),
+        (
+            "file_search",
+            "Search for text patterns (regex) across files. Returns matches with file paths and line numbers. Use instead of shell grep/rg.",
+        ),
+        (
+            "think",
+            "Record a reasoning step with no side effects. Use to plan, analyze, or think through a problem before acting.",
+        ),
+        (
+            "process",
+            "Manage background/interactive processes: spawn, poll, log, write, submit, kill, list. Use for long-running tasks, interactive processes, or background builds.",
+        ),
+        (
+            "web_fetch",
+            "Fetch a URL and extract readable text. Converts HTML to clean text. Use when you need to read web page content.",
         ),
         (
             "memory_store",
@@ -1728,7 +1752,13 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),
-        ("file_write", "Write file contents."),
+        ("file_write", "Write file contents (full overwrite)."),
+        ("file_edit", "Replace specific text in a file."),
+        ("file_list", "List directory contents."),
+        ("file_search", "Search for text patterns across files."),
+        ("think", "Record a reasoning step with no side effects."),
+        ("process", "Manage background/interactive processes."),
+        ("web_fetch", "Fetch a URL and extract readable text."),
         ("memory_store", "Save to memory."),
         ("memory_recall", "Search memory."),
         ("memory_forget", "Delete a memory entry."),

