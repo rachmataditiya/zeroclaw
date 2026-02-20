@@ -33,7 +33,7 @@ pub struct ComputerUseConfig {
 impl Default for ComputerUseConfig {
     fn default() -> Self {
         Self {
-            endpoint: "http://127.0.0.1:8787/v1/actions".into(),
+            endpoint: "http://127.0.0.1:9787/v1/actions".into(),
             api_key: None,
             timeout_ms: 15_000,
             allow_remote_endpoint: false,

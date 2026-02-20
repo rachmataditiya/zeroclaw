@@ -565,7 +565,7 @@ native_webdriver_url = "http://127.0.0.1:9515" # WebDriver endpoint (chromedrive
 # native_chrome_path = "/usr/bin/chromium"      # optional explicit browser binary for driver
 
 [browser.computer_use]
-endpoint = "http://127.0.0.1:8787/v1/actions"   # computer-use sidecar HTTP endpoint
+endpoint = "http://127.0.0.1:9787/v1/actions"   # computer-use sidecar HTTP endpoint
 timeout_ms = 15000            # per-action timeout
 allow_remote_endpoint = false  # secure default: only private/localhost endpoint
 window_allowlist = []          # optional window title/process allowlist hints

@@ -842,7 +842,7 @@ pub struct BrowserComputerUseConfig {
 }
 
 fn default_browser_computer_use_endpoint() -> String {
-    "http://127.0.0.1:8787/v1/actions".into()
+    "http://127.0.0.1:9787/v1/actions".into()
 }
 
 fn default_browser_computer_use_timeout_ms() -> u64 {
@@ -4596,7 +4596,7 @@ default_temperature = 0.7
         assert!(b.native_headless);
         assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
         assert!(b.native_chrome_path.is_none());
-        assert_eq!(b.computer_use.endpoint, "http://127.0.0.1:8787/v1/actions");
+        assert_eq!(b.computer_use.endpoint, "http://127.0.0.1:9787/v1/actions");
         assert_eq!(b.computer_use.timeout_ms, 15_000);
         assert!(!b.computer_use.allow_remote_endpoint);
         assert!(b.computer_use.window_allowlist.is_empty());
