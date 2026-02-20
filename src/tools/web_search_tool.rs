@@ -94,8 +94,8 @@ impl WebSearchTool {
         let client = builder.build()?;
 
         let response = client.get(&search_url).send().await.map_err(|e| {
-            tracing::warn!(url = %search_url, error = %e, "DuckDuckGo HTTP request failed");
-            anyhow::anyhow!("{e:#}")
+            tracing::warn!(url = %search_url, error = ?e, "DuckDuckGo HTTP request failed");
+            anyhow::Error::from(e)
         })?;
 
         if !response.status().is_success() {
@@ -183,7 +183,10 @@ impl WebSearchTool {
             .header("X-Subscription-Token", api_key)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+            .map_err(|e| {
+                tracing::warn!(error = ?e, "Brave HTTP request failed");
+                anyhow::Error::from(e)
+            })?;
 
         if !response.status().is_success() {
             anyhow::bail!("Brave search failed with status: {}", response.status());
@@ -295,7 +298,10 @@ impl WebSearchTool {
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+            .map_err(|e| {
+                tracing::warn!(error = ?e, "Perplexity HTTP request failed");
+                anyhow::Error::from(e)
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -357,7 +363,10 @@ impl WebSearchTool {
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+            .map_err(|e| {
+                tracing::warn!(error = ?e, "Grok HTTP request failed");
+                anyhow::Error::from(e)
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();

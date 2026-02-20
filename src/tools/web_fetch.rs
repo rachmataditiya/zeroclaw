@@ -253,11 +253,12 @@ impl Tool for WebFetchTool {
         let response = match client.get(url).send().await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(url, error = %format!("{e:#}"), "web_fetch HTTP request failed");
+                tracing::warn!(url, error = ?e, "web_fetch HTTP request failed");
+                let err_chain = format!("{:#}", anyhow::Error::from(e));
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Failed to fetch URL: {e:#}")),
+                    error: Some(format!("Failed to fetch URL: {err_chain}")),
                 });
             }
         };
