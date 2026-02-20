@@ -47,6 +47,25 @@ impl Observer for VerboseObserver {
             ObserverEvent::TurnComplete => {
                 eprintln!("< Complete");
             }
+            ObserverEvent::MemoryRead { key, results } => {
+                eprintln!("> Memory read: {key} ({results} results)");
+            }
+            ObserverEvent::MemoryWrite { key, category } => {
+                eprintln!("> Memory write: {key} [{category}]");
+            }
+            ObserverEvent::SkillInvoke { skill } => {
+                eprintln!("> Skill: {skill}");
+            }
+            ObserverEvent::QueryClassified {
+                category,
+                routed_model,
+                ..
+            } => {
+                eprintln!("> Classified: {category} → {routed_model}");
+            }
+            ObserverEvent::DelegateInvoke { agent_name, mode } => {
+                eprintln!("> Delegate: {agent_name} ({mode})");
+            }
             _ => {}
         }
     }

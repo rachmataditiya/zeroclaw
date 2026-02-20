@@ -37,7 +37,7 @@ use clap::{Parser, Subcommand};
 use dialoguer::{Input, Password};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{fmt, layer::SubscriberExt, EnvFilter};
 
 mod agent;
 mod approval;
@@ -494,14 +494,21 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO
-    let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .finish();
+    // Check command type before logging init — onboard needs early stderr-only logging,
+    // other commands defer until config is loaded (to support file logging).
+    let is_daemon = matches!(&cli.command, Commands::Daemon { .. });
 
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    // Onboard gets stderr-only logging immediately (config not yet loaded).
+    // Other commands get full logging (stderr + optional file) after config load.
+    if matches!(&cli.command, Commands::Onboard { .. }) {
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(env_filter)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("setting default subscriber failed");
+    }
 
     // Onboard runs quick setup by default, or the interactive wizard with --interactive.
     // The onboard wizard uses reqwest::blocking internally, which creates its own
@@ -548,6 +555,45 @@ async fn main() -> Result<()> {
     // All other commands need config loaded first
     let mut config = Config::load_or_init()?;
     config.apply_env_overrides();
+
+    // Initialize full logging subscriber (stderr + optional file layer)
+    let file_logging = is_daemon || config.logging.file_logging;
+    let _log_guard = if file_logging {
+        let log_dir = &config.logging.log_dir;
+        std::fs::create_dir_all(log_dir).ok();
+
+        let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(match config.logging.rotation.as_str() {
+                "hourly" => tracing_appender::rolling::Rotation::HOURLY,
+                "never" => tracing_appender::rolling::Rotation::NEVER,
+                _ => tracing_appender::rolling::Rotation::DAILY,
+            })
+            .filename_prefix("zeroclaw")
+            .filename_suffix("log")
+            .max_log_files(config.logging.max_files as usize)
+            .build(log_dir)
+            .expect("failed to create log file appender");
+
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let subscriber = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt::layer().with_ansi(true))
+            .with(fmt::layer().with_ansi(false).with_writer(non_blocking));
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("setting default subscriber failed");
+        Some(guard)
+    } else {
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(env_filter)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("setting default subscriber failed");
+        None
+    };
 
     match cli.command {
         Commands::Onboard { .. } => unreachable!(),

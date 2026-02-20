@@ -1631,7 +1631,8 @@ pub async fn run(
         )
         .await?;
         final_output = response.clone();
-        println!("{response}");
+        let now = chrono::Local::now();
+        println!("[{}] {response}", now.format("%H:%M:%S"));
         observer.record_event(&ObserverEvent::TurnComplete);
 
         // Auto-save assistant response to daily log
@@ -1641,6 +1642,10 @@ pub async fn run(
             let _ = mem
                 .store(&response_key, &summary, MemoryCategory::Daily, None)
                 .await;
+            observer.record_event(&ObserverEvent::MemoryWrite {
+                key: response_key,
+                category: "daily".into(),
+            });
         }
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
@@ -1651,7 +1656,8 @@ pub async fn run(
         let mut history = vec![ChatMessage::system(&system_prompt)];
 
         loop {
-            print!("> ");
+            let now = chrono::Local::now();
+            print!("[{}] > ", now.format("%H:%M:%S"));
             let _ = std::io::stdout().flush();
 
             let mut input = String::new();
@@ -1722,11 +1728,16 @@ pub async fn run(
                 let _ = mem
                     .store(&user_key, &user_input, MemoryCategory::Conversation, None)
                     .await;
+                observer.record_event(&ObserverEvent::MemoryWrite {
+                    key: user_key,
+                    category: "conversation".into(),
+                });
             }
 
             // Inject memory + hardware RAG context into user message
             let mem_context =
                 build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
+            let mem_has_context = !mem_context.is_empty();
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
@@ -1738,12 +1749,25 @@ pub async fn run(
             } else {
                 format!("{context}{user_input}")
             };
+            if mem_has_context {
+                observer.record_event(&ObserverEvent::MemoryRead {
+                    key: user_input.chars().take(50).collect(),
+                    results: context.lines().count(),
+                });
+            }
 
             history.push(ChatMessage::user(&enriched));
 
             // Classify the message to determine the effective model
             let effective_model =
                 classify_for_loop(&config, provider.as_ref(), &user_input, model_name).await;
+            if effective_model != model_name {
+                observer.record_event(&ObserverEvent::QueryClassified {
+                    input_preview: user_input.chars().take(50).collect(),
+                    category: "routed".into(),
+                    routed_model: effective_model.clone(),
+                });
+            }
 
             let response = match run_tool_call_loop(
                 provider.as_ref(),
@@ -1768,9 +1792,13 @@ pub async fn run(
                 }
             };
             final_output = response.clone();
+            let now = chrono::Local::now();
             if let Err(e) = crate::channels::Channel::send(
                 &cli,
-                &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
+                &crate::channels::traits::SendMessage::new(
+                    format!("\n[{}] {response}\n", now.format("%H:%M:%S")),
+                    "user",
+                ),
             )
             .await
             {
@@ -1801,6 +1829,10 @@ pub async fn run(
                 let _ = mem
                     .store(&response_key, &summary, MemoryCategory::Daily, None)
                     .await;
+                observer.record_event(&ObserverEvent::MemoryWrite {
+                    key: response_key,
+                    category: "daily".into(),
+                });
             }
         }
     }

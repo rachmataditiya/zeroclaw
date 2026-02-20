@@ -169,7 +169,12 @@ impl Observer for PrometheusObserver {
             ObserverEvent::ToolCallStart { tool: _ }
             | ObserverEvent::TurnComplete
             | ObserverEvent::LlmRequest { .. }
-            | ObserverEvent::LlmResponse { .. } => {}
+            | ObserverEvent::LlmResponse { .. }
+            | ObserverEvent::MemoryRead { .. }
+            | ObserverEvent::MemoryWrite { .. }
+            | ObserverEvent::SkillInvoke { .. }
+            | ObserverEvent::QueryClassified { .. }
+            | ObserverEvent::DelegateInvoke { .. } => {}
             ObserverEvent::ToolCall {
                 tool,
                 duration,

@@ -51,6 +51,31 @@ pub enum ObserverEvent {
         component: String,
         message: String,
     },
+    /// Memory read operation
+    MemoryRead {
+        key: String,
+        results: usize,
+    },
+    /// Memory write operation
+    MemoryWrite {
+        key: String,
+        category: String,
+    },
+    /// Skill invocation
+    SkillInvoke {
+        skill: String,
+    },
+    /// Query classification result
+    QueryClassified {
+        input_preview: String,
+        category: String,
+        routed_model: String,
+    },
+    /// Delegate agent invoked
+    DelegateInvoke {
+        agent_name: String,
+        mode: String,
+    },
 }
 
 /// Numeric metrics

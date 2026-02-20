@@ -148,6 +148,7 @@ pub fn run_wizard() -> Result<Config> {
         lang_exec: crate::config::LangExecConfig::default(),
         system_info: crate::config::SystemInfoConfig::default(),
         service_manager: crate::config::ServiceManagerConfig::default(),
+        logging: crate::config::LoggingConfig::default(),
     };
 
     println!(
@@ -380,6 +381,7 @@ pub fn run_quick_setup(
         lang_exec: crate::config::LangExecConfig::default(),
         system_info: crate::config::SystemInfoConfig::default(),
         service_manager: crate::config::ServiceManagerConfig::default(),
+        logging: crate::config::LoggingConfig::default(),
     };
 
     config.save()?;

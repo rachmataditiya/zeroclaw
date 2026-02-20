@@ -166,6 +166,10 @@ pub struct Config {
     /// Service/container manager tool configuration.
     #[serde(default)]
     pub service_manager: ServiceManagerConfig,
+
+    /// Logging configuration (file logging, rotation).
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 // ── Events ──────────────────────────────────────────────────────
@@ -1667,6 +1671,57 @@ pub struct ObservabilityConfig {
     pub otel_service_name: Option<String>,
 }
 
+// ── Logging ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    /// Directory for log files.
+    /// Default: "/var/log/zeroclaw" (Linux), "{config_dir}/logs" (macOS/Windows)
+    #[serde(default = "default_log_dir")]
+    pub log_dir: String,
+
+    /// Enable file logging. Auto-enabled when running as daemon.
+    #[serde(default)]
+    pub file_logging: bool,
+
+    /// Log rotation interval: "daily" (default) or "hourly" or "never"
+    #[serde(default = "default_log_rotation")]
+    pub rotation: String,
+
+    /// Max rotated log files to keep (default: 2)
+    #[serde(default = "default_max_log_files")]
+    pub max_files: u32,
+}
+
+fn default_log_dir() -> String {
+    if cfg!(target_os = "linux") {
+        "/var/log/zeroclaw".into()
+    } else {
+        directories::ProjectDirs::from("", "", "zeroclaw")
+            .map(|d| d.config_dir().join("logs").to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".zeroclaw/logs".into())
+    }
+}
+
+fn default_log_rotation() -> String {
+    "daily".into()
+}
+
+fn default_max_log_files() -> u32 {
+    2
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            log_dir: default_log_dir(),
+            file_logging: false,
+            rotation: default_log_rotation(),
+            max_files: default_max_log_files(),
+        }
+    }
+}
+
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
@@ -2801,6 +2856,7 @@ impl Default for Config {
             lang_exec: LangExecConfig::default(),
             system_info: SystemInfoConfig::default(),
             service_manager: ServiceManagerConfig::default(),
+            logging: LoggingConfig::default(),
         }
     }
 }
@@ -3636,6 +3692,7 @@ default_temperature = 0.7
             lang_exec: LangExecConfig::default(),
             system_info: SystemInfoConfig::default(),
             service_manager: ServiceManagerConfig::default(),
+            logging: LoggingConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -3782,6 +3839,7 @@ tool_dispatcher = "xml"
             lang_exec: LangExecConfig::default(),
             system_info: SystemInfoConfig::default(),
             service_manager: ServiceManagerConfig::default(),
+            logging: LoggingConfig::default(),
         };
 
         config.save().unwrap();

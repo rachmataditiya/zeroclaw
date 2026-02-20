@@ -253,6 +253,12 @@ fn install_linux(config: &Config) -> Result<()> {
     let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "zeroclaw.service"]));
     println!("✅ Installed systemd user service: {}", file.display());
     println!("   Start with: zeroclaw service start");
+
+    let log_dir = "/var/log/zeroclaw";
+    if !std::path::Path::new(log_dir).exists() {
+        println!("   Create log directory:");
+        println!("      sudo mkdir -p {log_dir} && sudo chown $(whoami) {log_dir}");
+    }
     Ok(())
 }
 

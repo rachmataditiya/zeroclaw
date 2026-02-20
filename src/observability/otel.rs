@@ -186,7 +186,12 @@ impl Observer for OtelObserver {
             }
             ObserverEvent::LlmRequest { .. }
             | ObserverEvent::ToolCallStart { .. }
-            | ObserverEvent::TurnComplete => {}
+            | ObserverEvent::TurnComplete
+            | ObserverEvent::MemoryRead { .. }
+            | ObserverEvent::MemoryWrite { .. }
+            | ObserverEvent::SkillInvoke { .. }
+            | ObserverEvent::QueryClassified { .. }
+            | ObserverEvent::DelegateInvoke { .. } => {}
             ObserverEvent::LlmResponse {
                 provider,
                 model,

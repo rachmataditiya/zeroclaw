@@ -1,6 +1,6 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use std::any::Any;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Log-based observer — uses tracing, zero external deps
 pub struct LogObserver;
@@ -78,6 +78,25 @@ impl Observer for LogObserver {
                     error = ?error_message,
                     "llm.response"
                 );
+            }
+            ObserverEvent::MemoryRead { key, results } => {
+                debug!(key = %key, results = results, "memory.read");
+            }
+            ObserverEvent::MemoryWrite { key, category } => {
+                debug!(key = %key, category = %category, "memory.write");
+            }
+            ObserverEvent::SkillInvoke { skill } => {
+                debug!(skill = %skill, "skill.invoke");
+            }
+            ObserverEvent::QueryClassified {
+                input_preview,
+                category,
+                routed_model,
+            } => {
+                debug!(input = %input_preview, category = %category, model = %routed_model, "query.classified");
+            }
+            ObserverEvent::DelegateInvoke { agent_name, mode } => {
+                debug!(agent = %agent_name, mode = %mode, "delegate.invoke");
             }
         }
     }
