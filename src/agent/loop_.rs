@@ -882,6 +882,12 @@ pub(crate) async fn run_tool_call_loop(
         tools_registry.iter().map(|tool| tool.spec()).collect();
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
+    tracing::debug!(
+        tools_count = tool_specs.len(),
+        native = use_native_tools,
+        "Tool call loop starting"
+    );
+
     for _iteration in 0..max_iterations {
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
@@ -962,6 +968,15 @@ pub(crate) async fn run_tool_call_loop(
                             calls = fallback_calls;
                         }
 
+                        if !calls.is_empty() {
+                            let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+                            tracing::debug!(
+                                count = calls.len(),
+                                tools = ?names,
+                                "Parsed tool calls from LLM response"
+                            );
+                        }
+
                         // Preserve native tool call IDs in assistant history so role=tool
                         // follow-up messages can reference the exact call id.
                         let assistant_history_content = if resp.tool_calls.is_empty() {
@@ -1005,6 +1020,7 @@ pub(crate) async fn run_tool_call_loop(
         };
 
         if tool_calls.is_empty() {
+            tracing::debug!("LLM returned no tool calls, returning final response");
             // No tool calls — this is the final response.
             // If a streaming sender is provided and we did NOT already stream chunks,
             // relay the text in small chunks so the channel can progressively update
