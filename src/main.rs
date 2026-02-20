@@ -575,8 +575,8 @@ async fn main() -> Result<()> {
             .expect("failed to create log file appender");
 
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-        let env_filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let env_filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
         let subscriber = tracing_subscriber::registry()
             .with(env_filter)
             .with(fmt::layer().with_ansi(true))
@@ -585,8 +585,8 @@ async fn main() -> Result<()> {
             .expect("setting default subscriber failed");
         Some(guard)
     } else {
-        let env_filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let env_filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
         let subscriber = fmt::Subscriber::builder()
             .with_env_filter(env_filter)
             .finish();

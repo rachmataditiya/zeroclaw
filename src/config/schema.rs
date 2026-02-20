@@ -1691,6 +1691,11 @@ pub struct LoggingConfig {
     /// Max rotated log files to keep (default: 2)
     #[serde(default = "default_max_log_files")]
     pub max_files: u32,
+
+    /// Log level: "error", "warn", "info", "debug", "trace" (default: "info").
+    /// Overridden by RUST_LOG env var when set.
+    #[serde(default = "default_log_level")]
+    pub level: String,
 }
 
 fn default_log_dir() -> String {
@@ -1711,6 +1716,10 @@ fn default_max_log_files() -> u32 {
     2
 }
 
+fn default_log_level() -> String {
+    "info".into()
+}
+
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
@@ -1718,6 +1727,7 @@ impl Default for LoggingConfig {
             file_logging: false,
             rotation: default_log_rotation(),
             max_files: default_max_log_files(),
+            level: default_log_level(),
         }
     }
 }

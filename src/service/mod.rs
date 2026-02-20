@@ -221,13 +221,19 @@ fn install_macos(config: &Config) -> Result<()> {
   <string>{stdout}</string>
   <key>StandardErrorPath</key>
   <string>{stderr}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUST_LOG</key>
+    <string>{log_level}</string>
+  </dict>
 </dict>
 </plist>
 "#,
         label = SERVICE_LABEL,
         exe = xml_escape(&exe.display().to_string()),
         stdout = xml_escape(&stdout.display().to_string()),
-        stderr = xml_escape(&stderr.display().to_string())
+        stderr = xml_escape(&stderr.display().to_string()),
+        log_level = xml_escape(&config.logging.level)
     );
 
     fs::write(&file, plist)?;
@@ -244,8 +250,9 @@ fn install_linux(config: &Config) -> Result<()> {
 
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
     let unit = format!(
-        "[Unit]\nDescription=ZeroClaw daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} daemon\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
-        exe.display()
+        "[Unit]\nDescription=ZeroClaw daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={exe} daemon\nEnvironment=RUST_LOG={log_level}\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+        exe = exe.display(),
+        log_level = config.logging.level
     );
 
     fs::write(&file, unit)?;
@@ -277,10 +284,11 @@ fn install_windows(config: &Config) -> Result<()> {
     let stderr_log = logs_dir.join("daemon.stderr.log");
 
     let wrapper_content = format!(
-        "@echo off\r\n\"{}\" daemon >>\"{}\" 2>>\"{}\"",
-        exe.display(),
-        stdout_log.display(),
-        stderr_log.display()
+        "@echo off\r\nset RUST_LOG={log_level}\r\n\"{exe}\" daemon >>\"{stdout}\" 2>>\"{stderr}\"",
+        log_level = config.logging.level,
+        exe = exe.display(),
+        stdout = stdout_log.display(),
+        stderr = stderr_log.display()
     );
     fs::write(&wrapper, &wrapper_content)?;
 
