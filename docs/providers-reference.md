@@ -128,3 +128,35 @@ Then call with a hint model name (for example from tool or integration paths):
 ```text
 hint:reasoning
 ```
+
+### Adaptive Query Classification
+
+When `[query_classification]` is enabled with `mode = "adaptive"`, ZeroClaw uses a fast LLM call to classify each user message as chat, simple task, or complex task before the main agent loop. Each category maps to a model hint, which routes through `[[model_routes]]`.
+
+```toml
+[query_classification]
+enabled = true
+mode = "adaptive"
+
+[query_classification.adaptive]
+provider = "groq"
+model = "llama-3.3-70b-versatile"
+chat_hint = "fast"
+complex_task_hint = "reasoning"
+
+[[model_routes]]
+hint = "fast"
+provider = "groq"
+model = "llama-3.3-70b-versatile"
+
+[[model_routes]]
+hint = "reasoning"
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4"
+```
+
+Classification cascade: adaptive runs first, then falls back to rule-based classification, then to the default model. See [config-reference.md](config-reference.md) for full option details.
+
+### Delegate Sub-Agents
+
+Delegate agents (`[agents.*]`) reuse provider IDs from the catalog above. See [config-reference.md](config-reference.md) for full `[agents.*]` configuration.

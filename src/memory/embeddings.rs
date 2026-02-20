@@ -154,6 +154,93 @@ impl EmbeddingProvider for OpenAiEmbedding {
     }
 }
 
+// ── Ollama embedding provider ────────────────────────────────
+
+pub struct OllamaEmbedding {
+    base_url: String,
+    model: String,
+    dims: usize,
+}
+
+impl OllamaEmbedding {
+    pub fn new(base_url: &str, model: &str, dims: usize) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model: model.to_string(),
+            dims,
+        }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        crate::config::build_runtime_proxy_client("memory.embeddings")
+    }
+
+    fn embed_url(&self) -> String {
+        format!("{}/api/embed", self.base_url)
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for OllamaEmbedding {
+    fn name(&self) -> &str {
+        "ollama"
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dims
+    }
+
+    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let body = serde_json::json!({
+            "model": self.model,
+            "input": texts,
+        });
+
+        let resp = self
+            .http_client()
+            .post(self.embed_url())
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Ollama embedding API error {status}: {text}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let data = json
+            .get("embeddings")
+            .and_then(|d| d.as_array())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Invalid Ollama embedding response: missing 'embeddings'")
+            })?;
+
+        let mut embeddings = Vec::with_capacity(data.len());
+        for item in data {
+            let arr = item
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("Invalid Ollama embedding item"))?;
+
+            #[allow(clippy::cast_possible_truncation)]
+            let vec: Vec<f32> = arr
+                .iter()
+                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .collect();
+
+            embeddings.push(vec);
+        }
+
+        Ok(embeddings)
+    }
+}
+
 // ── Factory ──────────────────────────────────────────────────
 
 pub fn create_embedding_provider(
@@ -171,6 +258,18 @@ pub fn create_embedding_provider(
                 model,
                 dims,
             ))
+        }
+        "ollama" => {
+            // api_key field doubles as base URL override if it looks like a URL
+            let base_url = api_key
+                .filter(|k| k.starts_with("http"))
+                .unwrap_or("http://localhost:11434");
+            let model_name = if model.is_empty() {
+                "nomic-embed-text"
+            } else {
+                model
+            };
+            Box::new(OllamaEmbedding::new(base_url, model_name, dims))
         }
         name if name.starts_with("custom:") => {
             let base_url = name.strip_prefix("custom:").unwrap_or("");
@@ -260,6 +359,56 @@ mod tests {
         // "custom:" with no URL — should still construct without panic
         let p = create_embedding_provider("custom:", None, "model", 768);
         assert_eq!(p.name(), "openai");
+    }
+
+    #[test]
+    fn factory_ollama_creates_provider() {
+        let p = create_embedding_provider("ollama", None, "nomic-embed-text", 768);
+        assert_eq!(p.name(), "ollama");
+        assert_eq!(p.dimensions(), 768);
+    }
+
+    #[test]
+    fn factory_ollama_custom_base_url() {
+        let p = create_embedding_provider(
+            "ollama",
+            Some("http://remote-host:11434"),
+            "nomic-embed-text",
+            768,
+        );
+        assert_eq!(p.name(), "ollama");
+    }
+
+    #[test]
+    fn factory_ollama_default_model() {
+        // Empty model string should default to nomic-embed-text
+        let p = create_embedding_provider("ollama", None, "", 768);
+        assert_eq!(p.name(), "ollama");
+    }
+
+    #[tokio::test]
+    async fn ollama_embed_empty_returns_empty() {
+        let p = OllamaEmbedding::new("http://localhost:11434", "nomic-embed-text", 768);
+        let result = p.embed(&[]).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn ollama_dimensions_passthrough() {
+        let p = OllamaEmbedding::new("http://localhost:11434", "nomic-embed-text", 384);
+        assert_eq!(p.dimensions(), 384);
+    }
+
+    #[test]
+    fn ollama_embed_url() {
+        let p = OllamaEmbedding::new("http://localhost:11434", "model", 768);
+        assert_eq!(p.embed_url(), "http://localhost:11434/api/embed");
+    }
+
+    #[test]
+    fn ollama_trailing_slash_stripped() {
+        let p = OllamaEmbedding::new("http://localhost:11434/", "model", 768);
+        assert_eq!(p.base_url, "http://localhost:11434");
     }
 
     #[test]

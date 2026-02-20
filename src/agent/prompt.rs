@@ -35,6 +35,7 @@ impl SystemPromptBuilder {
                 Box::new(IdentitySection),
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
+                Box::new(ReasoningSection),
                 Box::new(SkillsSection),
                 Box::new(WorkspaceSection),
                 Box::new(DateTimeSection),
@@ -65,6 +66,7 @@ impl SystemPromptBuilder {
 pub struct IdentitySection;
 pub struct ToolsSection;
 pub struct SafetySection;
+pub struct ReasoningSection;
 pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
@@ -140,6 +142,27 @@ impl PromptSection for SafetySection {
 
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
         Ok("## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm`.\n- When in doubt, ask before acting externally.".into())
+    }
+}
+
+impl PromptSection for ReasoningSection {
+    fn name(&self) -> &str {
+        "reasoning"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        if ctx.tools.is_empty() {
+            return Ok(String::new());
+        }
+
+        Ok("## Reasoning\n\n\
+When handling tasks that require tools:\n\
+1. **Assess** — Understand the request fully before acting.\n\
+2. **Plan** — Use the `think` tool to outline your approach when the task has multiple steps or ambiguity.\n\
+3. **Execute** — Call tools deliberately, one logical step at a time. Verify each result before proceeding.\n\
+4. **Verify** — Confirm the outcome matches the intent. If not, adjust and retry.\n\n\
+For simple questions or greetings, respond immediately without this process."
+            .into())
     }
 }
 
@@ -317,6 +340,41 @@ mod tests {
         assert!(prompt.contains("## Tools"));
         assert!(prompt.contains("test_tool"));
         assert!(prompt.contains("instr"));
+    }
+
+    #[test]
+    fn reasoning_section_emits_when_tools_present() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            identity_config: None,
+            dispatcher_instructions: "",
+        };
+        let section = ReasoningSection;
+        let output = section.build(&ctx).unwrap();
+        assert!(output.contains("## Reasoning"));
+        assert!(output.contains("Assess"));
+        assert!(output.contains("Plan"));
+        assert!(output.contains("Execute"));
+        assert!(output.contains("Verify"));
+    }
+
+    #[test]
+    fn reasoning_section_empty_when_no_tools() {
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &[],
+            skills: &[],
+            identity_config: None,
+            dispatcher_instructions: "",
+        };
+        let section = ReasoningSection;
+        let output = section.build(&ctx).unwrap();
+        assert!(output.is_empty());
     }
 
     #[test]

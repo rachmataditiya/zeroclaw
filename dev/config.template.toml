@@ -10,3 +10,51 @@ default_temperature = 0.7
 port = 3000
 host = "[::]"
 allow_public_bind = true
+
+# ── Adaptive Query Classification (optional) ─────────────
+# Automatically routes messages to fast/default/reasoning models.
+# Requires [[model_routes]] to be configured.
+#
+# [query_classification]
+# enabled = true
+# mode = "adaptive"
+#
+# [query_classification.adaptive]
+# provider = "groq"
+# model = "llama-3.3-70b-versatile"
+# chat_hint = "fast"
+# simple_task_hint = ""
+# complex_task_hint = "reasoning"
+#
+# [[model_routes]]
+# hint = "fast"
+# provider = "groq"
+# model = "llama-3.3-70b-versatile"
+#
+# [[model_routes]]
+# hint = "reasoning"
+# provider = "openrouter"
+# model = "anthropic/claude-sonnet-4"
+
+# ── Delegate Sub-Agents (optional) ────────────────────────
+# Define named sub-agents for multi-agent workflows.
+# The agent can delegate tasks to these sub-agents via the delegate tool.
+#
+# [agents.researcher]
+# provider = "openrouter"
+# model = "anthropic/claude-sonnet-4"
+# system_prompt = "You are a research specialist. Analyze topics thoroughly."
+# mode = "simple"
+#
+# [agents.coder]
+# provider = "openrouter"
+# model = "anthropic/claude-sonnet-4"
+# mode = "full"
+# allowed_tools = ["shell", "file_read", "file_write", "file_edit", "git_operations"]
+# max_iterations = 15
+#
+# [agents.background_worker]
+# provider = "groq"
+# model = "llama-3.3-70b-versatile"
+# mode = "full"
+# background = true

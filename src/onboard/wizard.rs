@@ -144,6 +144,10 @@ pub fn run_wizard() -> Result<Config> {
         mcp: crate::config::McpConfig::default(),
         events: crate::config::EventsConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
+        package_manager: crate::config::PackageManagerConfig::default(),
+        lang_exec: crate::config::LangExecConfig::default(),
+        system_info: crate::config::SystemInfoConfig::default(),
+        service_manager: crate::config::ServiceManagerConfig::default(),
     };
 
     println!(
@@ -372,6 +376,10 @@ pub fn run_quick_setup(
         mcp: crate::config::McpConfig::default(),
         events: crate::config::EventsConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
+        package_manager: crate::config::PackageManagerConfig::default(),
+        lang_exec: crate::config::LangExecConfig::default(),
+        system_info: crate::config::SystemInfoConfig::default(),
+        service_manager: crate::config::ServiceManagerConfig::default(),
     };
 
     config.save()?;
@@ -2438,6 +2446,12 @@ fn setup_memory() -> Result<MemoryConfig> {
         if auto_save { "on" } else { "off" }
     );
 
+    println!(
+        "  {} {}",
+        style("💡").cyan(),
+        style("Tip: Set embedding_provider = \"openai\" or \"ollama\" in config.toml for semantic search.").dim()
+    );
+
     let mut config = memory_config_defaults_for_backend(backend);
     config.auto_save = auto_save;
     Ok(config)
@@ -4384,6 +4398,22 @@ fn print_summary(config: &Config) {
         style(format!("{step}.")).cyan().bold()
     );
     println!("       {}", style("zeroclaw status").yellow());
+
+    println!();
+    println!(
+        "  {}",
+        style("Advanced features (edit config.toml to enable):")
+            .white()
+            .bold()
+    );
+    println!("    Delegate agents:      [agents.*] — multi-agent workflows");
+    println!("    Model routes:         [[model_routes]] — route by hint");
+    println!("    Query classification: [query_classification] — auto-model selection");
+    println!("    MCP servers:          [mcp] — external tool servers");
+    println!("    Events:               [events] — webhook/AMQP triggers");
+    println!("    Embeddings:           [memory].embedding_provider — semantic search");
+    println!("    Host tools:           [lang_exec], [package_manager], [service_manager]");
+    println!("    See: {}", style("docs/config-reference.md").yellow());
 
     println!();
     println!(
