@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -492,20 +493,103 @@ fn extract_responses_tool_calls(response: &ResponsesResponse) -> Vec<ProviderToo
         .collect()
 }
 
-fn extract_stream_event_full(
-    event: &Value,
-    saw_delta: bool,
-) -> (Option<String>, Vec<ProviderToolCall>) {
+/// Outcome of processing a single SSE event in the full (text + tool calls) path.
+enum StreamEventAction {
+    /// A text delta to accumulate.
+    TextDelta(String),
+    /// A complete text snapshot (from `response.output_text.done` or `response.completed`).
+    TextDone(String),
+    /// A new function call was announced — create a partial entry.
+    FunctionCallAdded { call_id: String, name: String },
+    /// An arguments delta for a function call.
+    FunctionCallArgsDelta { call_id: String, delta: String },
+    /// Arguments for a function call are complete.
+    FunctionCallArgsDone { call_id: String, arguments: String },
+    /// The authoritative completed response with tool calls.
+    Completed {
+        text: Option<String>,
+        tool_calls: Vec<ProviderToolCall>,
+    },
+    /// Nothing actionable.
+    None,
+}
+
+fn classify_stream_event(event: &Value, saw_delta: bool) -> StreamEventAction {
     let event_type = event.get("type").and_then(Value::as_str);
     match event_type {
-        Some("response.output_text.delta") => (
-            nonempty_preserve(event.get("delta").and_then(Value::as_str)),
-            Vec::new(),
-        ),
-        Some("response.output_text.done") if !saw_delta => (
-            nonempty_preserve(event.get("text").and_then(Value::as_str)),
-            Vec::new(),
-        ),
+        Some("response.output_text.delta") => {
+            if let Some(text) = nonempty_preserve(event.get("delta").and_then(Value::as_str)) {
+                StreamEventAction::TextDelta(text)
+            } else {
+                StreamEventAction::None
+            }
+        }
+        Some("response.output_text.done") if !saw_delta => {
+            if let Some(text) = nonempty_preserve(event.get("text").and_then(Value::as_str)) {
+                StreamEventAction::TextDone(text)
+            } else {
+                StreamEventAction::None
+            }
+        }
+        // Incremental tool call events from the Codex Responses API.
+        Some("response.output_item.added") => {
+            let item = event.get("item").unwrap_or(event);
+            if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if call_id.is_empty() {
+                    StreamEventAction::None
+                } else {
+                    StreamEventAction::FunctionCallAdded { call_id, name }
+                }
+            } else {
+                StreamEventAction::None
+            }
+        }
+        Some("response.function_call_arguments.delta") => {
+            let call_id = event
+                .get("call_id")
+                .or_else(|| event.get("item_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let delta = event
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if call_id.is_empty() {
+                StreamEventAction::None
+            } else {
+                StreamEventAction::FunctionCallArgsDelta { call_id, delta }
+            }
+        }
+        Some("response.function_call_arguments.done") => {
+            let call_id = event
+                .get("call_id")
+                .or_else(|| event.get("item_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let arguments = event
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if call_id.is_empty() {
+                StreamEventAction::None
+            } else {
+                StreamEventAction::FunctionCallArgsDone { call_id, arguments }
+            }
+        }
         Some("response.completed" | "response.done") => {
             if let Some(resp) = event
                 .get("response")
@@ -513,38 +597,90 @@ fn extract_stream_event_full(
             {
                 let text = extract_responses_text(&resp);
                 let tool_calls = extract_responses_tool_calls(&resp);
-                (text, tool_calls)
+                StreamEventAction::Completed { text, tool_calls }
             } else {
-                (None, Vec::new())
+                StreamEventAction::None
             }
         }
-        _ => (None, Vec::new()),
+        _ => StreamEventAction::None,
     }
+}
+
+/// Partial tool call being accumulated from incremental SSE events.
+#[derive(Debug, Clone)]
+struct PartialToolCall {
+    call_id: String,
+    name: String,
+    arguments: String,
+    /// Insertion order so we can emit calls in the order the API announced them.
+    order: usize,
 }
 
 fn parse_sse_full(body: &str) -> anyhow::Result<(Option<String>, Vec<ProviderToolCall>)> {
     let mut saw_delta = false;
     let mut delta_accumulator = String::new();
     let mut fallback_text = None;
-    let mut tool_calls = Vec::new();
+    // Authoritative tool calls from response.completed (if present).
+    let mut completed_tool_calls: Option<Vec<ProviderToolCall>> = None;
+    // Incremental tool call accumulator keyed by call_id.
+    let mut partial_calls: HashMap<String, PartialToolCall> = HashMap::new();
+    let mut partial_order: usize = 0;
+    let mut event_types_seen: Vec<String> = Vec::new();
     let mut buffer = body.to_string();
 
     let mut process_event = |event: Value| -> anyhow::Result<()> {
         if let Some(message) = extract_stream_error_message(&event) {
             return Err(anyhow::anyhow!("OpenAI Codex stream error: {message}"));
         }
-        let (text, calls) = extract_stream_event_full(&event, saw_delta);
-        if !calls.is_empty() {
-            tool_calls = calls;
+        if let Some(et) = event.get("type").and_then(Value::as_str) {
+            event_types_seen.push(et.to_string());
         }
-        if let Some(text) = text {
-            let event_type = event.get("type").and_then(Value::as_str);
-            if event_type == Some("response.output_text.delta") {
+        match classify_stream_event(&event, saw_delta) {
+            StreamEventAction::TextDelta(text) => {
                 saw_delta = true;
                 delta_accumulator.push_str(&text);
-            } else if fallback_text.is_none() {
-                fallback_text = Some(text);
             }
+            StreamEventAction::TextDone(text) => {
+                if fallback_text.is_none() {
+                    fallback_text = Some(text);
+                }
+            }
+            StreamEventAction::FunctionCallAdded { call_id, name } => {
+                partial_calls.entry(call_id.clone()).or_insert_with(|| {
+                    let order = partial_order;
+                    partial_order += 1;
+                    PartialToolCall {
+                        call_id,
+                        name,
+                        arguments: String::new(),
+                        order,
+                    }
+                });
+            }
+            StreamEventAction::FunctionCallArgsDelta { call_id, delta } => {
+                if let Some(entry) = partial_calls.get_mut(&call_id) {
+                    entry.arguments.push_str(&delta);
+                }
+            }
+            StreamEventAction::FunctionCallArgsDone { call_id, arguments } => {
+                if let Some(entry) = partial_calls.get_mut(&call_id) {
+                    // Use the final arguments from the done event (authoritative).
+                    if !arguments.is_empty() {
+                        entry.arguments = arguments;
+                    }
+                }
+            }
+            StreamEventAction::Completed { text, tool_calls } => {
+                if !tool_calls.is_empty() {
+                    completed_tool_calls = Some(tool_calls);
+                }
+                if let Some(text) = text {
+                    if fallback_text.is_none() {
+                        fallback_text = Some(text);
+                    }
+                }
+            }
+            StreamEventAction::None => {}
         }
         Ok(())
     };
@@ -601,6 +737,25 @@ fn parse_sse_full(body: &str) -> anyhow::Result<(Option<String>, Vec<ProviderToo
         fallback_text
     };
 
+    // Prefer authoritative completed tool calls; fall back to incrementally accumulated ones.
+    let tool_calls = if let Some(calls) = completed_tool_calls {
+        calls
+    } else if !partial_calls.is_empty() {
+        let mut calls: Vec<PartialToolCall> = partial_calls.into_values().collect();
+        calls.sort_by_key(|c| c.order);
+        calls
+            .into_iter()
+            .filter(|c| !c.name.is_empty())
+            .map(|c| ProviderToolCall {
+                id: c.call_id,
+                name: c.name,
+                arguments: c.arguments,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Ok((text, tool_calls))
 }
 
@@ -617,8 +772,17 @@ async fn decode_responses_body_full(
     let body_trimmed = body.trim_start();
     let looks_like_sse = body_trimmed.starts_with("event:") || body_trimmed.starts_with("data:");
     if looks_like_sse {
+        // Collect event types for diagnostics.
+        let event_types: Vec<String> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+            .filter_map(|v| v.get("type").and_then(Value::as_str).map(str::to_string))
+            .collect();
         return Err(anyhow::anyhow!(
-            "No response from OpenAI Codex stream payload: {}",
+            "No response from OpenAI Codex stream (body_len={}, event_types={:?}): {}",
+            body.len(),
+            event_types,
             super::sanitize_api_error(&body)
         ));
     }
@@ -1167,5 +1331,180 @@ data: [DONE]
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "call_99");
         assert_eq!(tool_calls[0].name, "file_read");
+    }
+
+    #[test]
+    fn parse_sse_full_incremental_tool_calls_without_completed() {
+        // Simulates a stream where tool calls arrive incrementally but
+        // response.completed is absent (e.g., truncated stream).
+        let payload = [
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.output_item.added",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_inc_1",
+                        "name": "shell"
+                    }
+                })
+            ),
+            String::new(), // blank line = SSE separator
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.function_call_arguments.delta",
+                    "call_id": "call_inc_1",
+                    "delta": "{\"cmd\":"
+                })
+            ),
+            String::new(),
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.function_call_arguments.delta",
+                    "call_id": "call_inc_1",
+                    "delta": "\"ls\"}"
+                })
+            ),
+            String::new(),
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.function_call_arguments.done",
+                    "call_id": "call_inc_1",
+                    "arguments": "{\"cmd\":\"ls\"}"
+                })
+            ),
+            String::new(),
+            "data: [DONE]".to_string(),
+            String::new(),
+        ]
+        .join("\n");
+
+        let (text, tool_calls) = parse_sse_full(&payload).unwrap();
+        assert!(text.is_none());
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_inc_1");
+        assert_eq!(tool_calls[0].name, "shell");
+        assert_eq!(tool_calls[0].arguments, r#"{"cmd":"ls"}"#);
+    }
+
+    #[test]
+    fn parse_sse_full_completed_overrides_incremental() {
+        // When both incremental events and response.completed are present,
+        // the completed event's tool calls take precedence.
+        let payload = [
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.output_item.added",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_inc_1",
+                        "name": "shell"
+                    }
+                })
+            ),
+            String::new(),
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.function_call_arguments.done",
+                    "call_id": "call_inc_1",
+                    "arguments": "{\"cmd\":\"ls\"}"
+                })
+            ),
+            String::new(),
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.completed",
+                    "response": {
+                        "output": [
+                            {
+                                "type": "function_call",
+                                "call_id": "call_auth_1",
+                                "name": "file_read",
+                                "arguments": "{\"path\":\"main.rs\"}"
+                            }
+                        ],
+                        "output_text": null
+                    }
+                })
+            ),
+            String::new(),
+            "data: [DONE]".to_string(),
+            String::new(),
+        ]
+        .join("\n");
+
+        let (_, tool_calls) = parse_sse_full(&payload).unwrap();
+        // Completed event's tool calls win.
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_auth_1");
+        assert_eq!(tool_calls[0].name, "file_read");
+    }
+
+    #[test]
+    fn parse_sse_full_incremental_multiple_tool_calls() {
+        // Multiple tool calls accumulated incrementally.
+        let payload = [
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.output_item.added",
+                    "item": {"type": "function_call", "call_id": "call_a", "name": "shell"}
+                })
+            ),
+            String::new(),
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.output_item.added",
+                    "item": {"type": "function_call", "call_id": "call_b", "name": "file_read"}
+                })
+            ),
+            String::new(),
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.function_call_arguments.done",
+                    "call_id": "call_a",
+                    "arguments": "{\"cmd\":\"pwd\"}"
+                })
+            ),
+            String::new(),
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "response.function_call_arguments.done",
+                    "call_id": "call_b",
+                    "arguments": "{\"path\":\"Cargo.toml\"}"
+                })
+            ),
+            String::new(),
+            "data: [DONE]".to_string(),
+            String::new(),
+        ]
+        .join("\n");
+
+        let (_, tool_calls) = parse_sse_full(&payload).unwrap();
+        assert_eq!(tool_calls.len(), 2);
+        // Verify insertion order is preserved.
+        assert_eq!(tool_calls[0].id, "call_a");
+        assert_eq!(tool_calls[0].name, "shell");
+        assert_eq!(tool_calls[1].id, "call_b");
+        assert_eq!(tool_calls[1].name, "file_read");
+    }
+
+    #[test]
+    fn parse_sse_full_truncated_stream_diagnostic() {
+        // Empty stream with only SSE markers but no useful data — should produce an error.
+        let payload = "data: {\"type\":\"response.created\"}\n\n";
+        let (text, tool_calls) = parse_sse_full(payload).unwrap();
+        // No text or tool calls, but no error either (error comes from decode_responses_body_full).
+        assert!(text.is_none());
+        assert!(tool_calls.is_empty());
     }
 }

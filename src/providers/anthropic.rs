@@ -249,7 +249,10 @@ impl AnthropicProvider {
         }
         for call in tool_calls {
             let input = serde_json::from_str::<serde_json::Value>(&call.arguments)
-                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+                .unwrap_or_else(|err| {
+                    tracing::warn!(tool = %call.name, error = %err, "Anthropic: failed to parse tool arguments as JSON");
+                    serde_json::Value::Object(serde_json::Map::new())
+                });
             blocks.push(NativeContentOut::ToolUse {
                 id: call.id,
                 name: call.name,
@@ -299,6 +302,12 @@ impl AnthropicProvider {
                             content: blocks,
                         });
                     } else {
+                        if msg.content.contains("tool_calls") {
+                            tracing::warn!(
+                                content_len = msg.content.len(),
+                                "Anthropic: assistant message contains 'tool_calls' but parse failed — history lost"
+                            );
+                        }
                         native_messages.push(NativeMessage {
                             role: "assistant".to_string(),
                             content: vec![NativeContentOut::Text {
@@ -312,6 +321,10 @@ impl AnthropicProvider {
                     if let Some(tool_result) = Self::parse_tool_result_message(&msg.content) {
                         native_messages.push(tool_result);
                     } else {
+                        tracing::warn!(
+                            content_len = msg.content.len(),
+                            "Anthropic: tool result message failed to parse — sending as plain text"
+                        );
                         native_messages.push(NativeMessage {
                             role: "user".to_string(),
                             content: vec![NativeContentOut::Text {
@@ -374,13 +387,19 @@ impl AnthropicProvider {
                 "tool_use" => {
                     let name = block.name.unwrap_or_default();
                     if name.is_empty() {
+                        tracing::warn!(block_id = ?block.id, "Anthropic: tool_use block has empty name — dropping");
                         continue;
                     }
-                    let arguments = block
-                        .input
-                        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+                    let arguments = block.input.unwrap_or_else(|| {
+                        tracing::debug!(tool = %name, "Anthropic: tool_use block missing 'input', defaulting to {{}}");
+                        serde_json::Value::Object(serde_json::Map::new())
+                    });
                     tool_calls.push(ProviderToolCall {
-                        id: block.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        id: block.id.unwrap_or_else(|| {
+                            let id = uuid::Uuid::new_v4().to_string();
+                            tracing::debug!(tool = %name, "Anthropic: tool call missing ID, generated UUID");
+                            id
+                        }),
                         name,
                         arguments: arguments.to_string(),
                     });

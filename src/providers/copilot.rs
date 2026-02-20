@@ -269,6 +269,10 @@ impl CopilotProvider {
                                     tool_calls: Some(tool_calls),
                                 };
                             }
+                            tracing::warn!(
+                                content_len = message.content.len(),
+                                "Copilot: assistant message has 'tool_calls' key but failed to parse — history lost"
+                            );
                         }
                     }
                 }
@@ -291,6 +295,10 @@ impl CopilotProvider {
                             tool_calls: None,
                         };
                     }
+                    tracing::warn!(
+                        content_len = message.content.len(),
+                        "Copilot: tool result message is not valid JSON — sending as plain text"
+                    );
                 }
 
                 ApiMessage {
@@ -352,9 +360,11 @@ impl CopilotProvider {
             .unwrap_or_default()
             .into_iter()
             .map(|tool_call| ProviderToolCall {
-                id: tool_call
-                    .id
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                id: tool_call.id.unwrap_or_else(|| {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    tracing::debug!(tool = %tool_call.function.name, "Copilot: tool call missing ID, generated UUID");
+                    id
+                }),
                 name: tool_call.function.name,
                 arguments: tool_call.function.arguments,
             })

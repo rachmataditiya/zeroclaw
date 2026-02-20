@@ -672,6 +672,10 @@ impl OpenAiCompatibleProvider {
                                     reasoning_content,
                                 };
                             }
+                            tracing::warn!(
+                                content_len = message.content.len(),
+                                "Compatible: assistant message has 'tool_calls' key but failed to parse — history lost"
+                            );
                         }
                     }
                 }
@@ -696,6 +700,10 @@ impl OpenAiCompatibleProvider {
                             reasoning_content: None,
                         };
                     }
+                    tracing::warn!(
+                        content_len = message.content.len(),
+                        "Compatible: tool result message is not valid JSON — sending as plain text"
+                    );
                 }
 
                 NativeMessage {
@@ -744,9 +752,16 @@ impl OpenAiCompatibleProvider {
             .filter_map(|tc| {
                 let function = tc.function?;
                 let name = function.name?;
-                let arguments = function.arguments.unwrap_or_else(|| "{}".to_string());
+                let arguments = function.arguments.unwrap_or_else(|| {
+                    tracing::debug!(tool = ?name, "Compatible: tool call arguments null, defaulting to '{{}}'");
+                    "{}".to_string()
+                });
                 Some(ProviderToolCall {
-                    id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    id: tc.id.unwrap_or_else(|| {
+                        let id = uuid::Uuid::new_v4().to_string();
+                        tracing::debug!(tool = ?name, "Compatible: tool call missing ID, generated UUID");
+                        id
+                    }),
                     name,
                     arguments,
                 })
@@ -1039,7 +1054,11 @@ impl Provider for OpenAiCompatibleProvider {
                 let name = function.name?;
                 let arguments = function.arguments.unwrap_or_else(|| "{}".to_string());
                 Some(ProviderToolCall {
-                    id: uuid::Uuid::new_v4().to_string(),
+                    id: tc.id.clone().unwrap_or_else(|| {
+                        let id = uuid::Uuid::new_v4().to_string();
+                        tracing::debug!(tool = ?name, "Compatible chat_with_tools: generated UUID for missing ID");
+                        id
+                    }),
                     name,
                     arguments,
                 })

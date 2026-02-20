@@ -23,6 +23,11 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
+/// Maximum characters per tool result before truncation.
+/// Prevents large tool outputs (e.g., shell 1MB limit) from overwhelming the LLM context window.
+/// ~50K chars ≈ ~12.5K tokens, safe for most model context windows.
+const MAX_TOOL_RESULT_CHARS: usize = 50_000;
+
 static SENSITIVE_KEY_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSet::new([
         r"(?i)token",
@@ -278,10 +283,26 @@ fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool>
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
 
+/// Truncate a tool result to prevent large outputs from overwhelming the LLM context window.
+fn truncate_tool_result(result: &str) -> String {
+    if result.len() <= MAX_TOOL_RESULT_CHARS {
+        return result.to_string();
+    }
+    truncate_with_ellipsis(result, MAX_TOOL_RESULT_CHARS)
+        + "\n\n[... output truncated to fit context window]"
+}
+
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     match raw {
         Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
-            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    error = %err,
+                    raw_len = s.len(),
+                    "Failed to parse tool call arguments string as JSON, falling back to {{}}"
+                );
+                serde_json::Value::Object(serde_json::Map::new())
+            }),
         Some(value) => value.clone(),
         None => serde_json::Value::Object(serde_json::Map::new()),
     }
@@ -751,10 +772,21 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 fn parse_structured_tool_calls(tool_calls: &[ToolCall]) -> Vec<ParsedToolCall> {
     tool_calls
         .iter()
-        .map(|call| ParsedToolCall {
-            name: call.name.clone(),
-            arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
-                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+        .map(|call| {
+            let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        tool = %call.name,
+                        error = %err,
+                        raw_len = call.arguments.len(),
+                        "Failed to parse native tool call arguments as JSON, falling back to {{}}"
+                    );
+                    serde_json::Value::Object(serde_json::Map::new())
+                });
+            ParsedToolCall {
+                name: call.name.clone(),
+                arguments,
+            }
         })
         .collect()
 }
@@ -1120,6 +1152,7 @@ pub(crate) async fn run_tool_call_loop(
                 format!("Unknown tool: {}", call.name)
             };
 
+            let result = truncate_tool_result(&result);
             individual_results.push(result.clone());
             let _ = writeln!(
                 tool_results,
@@ -1136,7 +1169,18 @@ pub(crate) async fn run_tool_call_loop(
         if native_tool_calls.is_empty() {
             history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
         } else {
-            for (native_call, result) in native_tool_calls.iter().zip(individual_results.iter()) {
+            if native_tool_calls.len() != individual_results.len() {
+                tracing::warn!(
+                    native_calls = native_tool_calls.len(),
+                    results = individual_results.len(),
+                    "Native tool call count differs from result count — results may be misaligned"
+                );
+            }
+            for (i, native_call) in native_tool_calls.iter().enumerate() {
+                let result = individual_results.get(i).map_or_else(
+                    || "Error: no result for this tool call".to_string(),
+                    |r| r.clone(),
+                );
                 let tool_msg = serde_json::json!({
                     "tool_call_id": native_call.id,
                     "content": result,

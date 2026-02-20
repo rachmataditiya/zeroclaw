@@ -176,6 +176,10 @@ impl OpenRouterProvider {
                                     reasoning_content,
                                 };
                             }
+                            tracing::warn!(
+                                content_len = m.content.len(),
+                                "OpenRouter: assistant message has 'tool_calls' key but failed to parse — history lost"
+                            );
                         }
                     }
                 }
@@ -198,6 +202,10 @@ impl OpenRouterProvider {
                             reasoning_content: None,
                         };
                     }
+                    tracing::warn!(
+                        content_len = m.content.len(),
+                        "OpenRouter: tool result message is not valid JSON — sending as plain text"
+                    );
                 }
 
                 NativeMessage {
@@ -217,7 +225,11 @@ impl OpenRouterProvider {
             .unwrap_or_default()
             .into_iter()
             .map(|tc| ProviderToolCall {
-                id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                id: tc.id.unwrap_or_else(|| {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    tracing::debug!(tool = %tc.function.name, "OpenRouter: tool call missing ID, generated UUID");
+                    id
+                }),
                 name: tc.function.name,
                 arguments: tc.function.arguments,
             })
