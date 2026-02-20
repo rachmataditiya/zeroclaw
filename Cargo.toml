@@ -51,8 +51,8 @@ base64 = "0.22"
 # URL encoding for web search
 urlencoding = "2.1"
 
-# libcurl HTTP client for web tools (system TLS, more reliable in Docker/constrained envs)
-curl = "0.4"
+# libcurl HTTP client for web tools (bundled modern OpenSSL, avoids old system LibreSSL)
+curl = { version = "0.4", features = ["static-curl", "static-ssl"] }
 
 # Optional Rust-native browser automation backend
 fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
