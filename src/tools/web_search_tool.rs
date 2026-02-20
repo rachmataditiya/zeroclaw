@@ -86,27 +86,20 @@ impl WebSearchTool {
         let encoded_query = urlencoding::encode(query);
         let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
 
-        let builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .connect_timeout(Duration::from_secs(10))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_search");
-        let client = builder.build()?;
+        let resp = super::curl_client::curl_get(
+            &search_url,
+            &[],
+            Duration::from_secs(self.timeout_secs),
+            Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+            true,
+        )
+        .await?;
 
-        let response = client.get(&search_url).send().await.map_err(|e| {
-            tracing::warn!(url = %search_url, error = ?e, "DuckDuckGo HTTP request failed");
-            anyhow::Error::from(e)
-        })?;
-
-        if !response.status().is_success() {
-            anyhow::bail!(
-                "DuckDuckGo search failed with status: {}",
-                response.status()
-            );
+        if resp.status < 200 || resp.status >= 300 {
+            anyhow::bail!("DuckDuckGo search failed with status: {}", resp.status);
         }
 
-        let html = response.text().await?;
-        self.parse_duckduckgo_results(&html, query)
+        self.parse_duckduckgo_results(&resp.body, query)
     }
 
     fn parse_duckduckgo_results(&self, html: &str, query: &str) -> anyhow::Result<String> {
@@ -171,28 +164,23 @@ impl WebSearchTool {
             let _ = write!(search_url, "&freshness={f}");
         }
 
-        let builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .connect_timeout(Duration::from_secs(10));
-        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_search");
-        let client = builder.build()?;
+        let resp = super::curl_client::curl_get(
+            &search_url,
+            &[
+                ("Accept", "application/json"),
+                ("X-Subscription-Token", api_key),
+            ],
+            Duration::from_secs(self.timeout_secs),
+            None,
+            false,
+        )
+        .await?;
 
-        let response = client
-            .get(&search_url)
-            .header("Accept", "application/json")
-            .header("X-Subscription-Token", api_key)
-            .send()
-            .await
-            .map_err(|e| {
-                tracing::warn!(error = ?e, "Brave HTTP request failed");
-                anyhow::Error::from(e)
-            })?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("Brave search failed with status: {}", response.status());
+        if resp.status < 200 || resp.status >= 300 {
+            anyhow::bail!("Brave search failed with status: {}", resp.status);
         }
 
-        let json: serde_json::Value = response.json().await?;
+        let json: serde_json::Value = serde_json::from_str(&resp.body)?;
         self.parse_brave_results(&json, query)
     }
 
@@ -285,34 +273,25 @@ impl WebSearchTool {
             "search_context": search_context,
         });
 
-        let builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .connect_timeout(Duration::from_secs(10));
-        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_search");
-        let client = builder.build()?;
+        let post_url = format!("{base_url}/chat/completions");
+        let auth_header = format!("Bearer {api_key}");
+        let resp = super::curl_client::curl_post_json(
+            &post_url,
+            &body.to_string(),
+            &[("Authorization", &auth_header)],
+            Duration::from_secs(self.timeout_secs),
+        )
+        .await?;
 
-        let response = client
-            .post(format!("{base_url}/chat/completions"))
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                tracing::warn!(error = ?e, "Perplexity HTTP request failed");
-                anyhow::Error::from(e)
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "unknown error".to_string());
-            anyhow::bail!("Perplexity search failed (HTTP {status}): {error_text}");
+        if resp.status < 200 || resp.status >= 300 {
+            anyhow::bail!(
+                "Perplexity search failed (HTTP {}): {}",
+                resp.status,
+                resp.body
+            );
         }
 
-        let resp: serde_json::Value = response.json().await?;
+        let resp: serde_json::Value = serde_json::from_str(&resp.body)?;
         let content = resp["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("No results");
@@ -350,34 +329,20 @@ impl WebSearchTool {
             "input": query,
         });
 
-        let builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .connect_timeout(Duration::from_secs(10));
-        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_search");
-        let client = builder.build()?;
+        let auth_header = format!("Bearer {api_key}");
+        let resp = super::curl_client::curl_post_json(
+            "https://api.x.ai/v1/responses",
+            &body.to_string(),
+            &[("Authorization", &auth_header)],
+            Duration::from_secs(self.timeout_secs),
+        )
+        .await?;
 
-        let response = client
-            .post("https://api.x.ai/v1/responses")
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                tracing::warn!(error = ?e, "Grok HTTP request failed");
-                anyhow::Error::from(e)
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "unknown error".to_string());
-            anyhow::bail!("Grok search failed (HTTP {status}): {error_text}");
+        if resp.status < 200 || resp.status >= 300 {
+            anyhow::bail!("Grok search failed (HTTP {}): {}", resp.status, resp.body);
         }
 
-        let resp: serde_json::Value = response.json().await?;
+        let resp: serde_json::Value = serde_json::from_str(&resp.body)?;
 
         // Parse Grok response format: output[].content[].text + annotations
         let mut result = format!("Search results for: {} (via Grok)\n", query);

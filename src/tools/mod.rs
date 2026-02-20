@@ -7,6 +7,7 @@ pub mod cron_remove;
 pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
+pub mod curl_client;
 pub mod delegate;
 pub mod file_edit;
 pub mod file_list;

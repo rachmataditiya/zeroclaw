@@ -239,56 +239,44 @@ impl Tool for WebFetchTool {
             });
         }
 
-        // Build client with proxy support
-        let builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .connect_timeout(Duration::from_secs(10))
-            .user_agent("ZeroClaw/1.0")
-            .redirect(reqwest::redirect::Policy::limited(5));
-        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_fetch");
-        let client = builder
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {e:#}"))?;
-
-        let response = match client.get(url).send().await {
+        // Fetch URL using libcurl (system TLS)
+        let resp = match super::curl_client::curl_get(
+            url,
+            &[],
+            Duration::from_secs(self.timeout_secs),
+            Some("ZeroClaw/1.0"),
+            true,
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(url, error = ?e, "web_fetch HTTP request failed");
-                let err_chain = format!("{:#}", anyhow::Error::from(e));
+                tracing::warn!(url, error = %e, "web_fetch curl request failed");
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Failed to fetch URL: {err_chain}")),
+                    error: Some(format!("Failed to fetch URL: {e}")),
                 });
             }
         };
 
-        let status = response.status();
-        if !status.is_success() {
+        if resp.status < 200 || resp.status >= 300 {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("HTTP {status} for {url}")),
+                error: Some(format!("HTTP {} for {url}", resp.status)),
             });
         }
 
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+        // Extract content-type from response headers
+        let content_type = resp
+            .headers
+            .iter()
+            .find(|h| h.to_lowercase().starts_with("content-type:"))
+            .map(|h| h.split_once(':').map(|x| x.1).unwrap_or("").trim().to_string())
+            .unwrap_or_default();
 
-        let body = match response.text().await {
-            Ok(b) => b,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to read response body: {e}")),
-                });
-            }
-        };
+        let body = resp.body;
 
         // Convert HTML to text, or return raw text for non-HTML
         let text =
