@@ -2,7 +2,6 @@ use super::traits::{Tool, ToolResult};
 use crate::security::content_wrapper::{self, ContentSource};
 use crate::util::cache::TtlCache;
 use async_trait::async_trait;
-use regex::Regex;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +13,7 @@ const DEFAULT_CACHE_TTL_MINUTES: u32 = 15;
 const MAX_CACHE_ENTRIES: usize = 200;
 
 /// Web search tool for searching the internet.
-/// Supports multiple providers: DuckDuckGo (free), Brave (requires API key),
+/// Supports multiple providers: Brave (requires API key),
 /// Perplexity (via OpenRouter or direct API), Grok (xAI).
 pub struct WebSearchTool {
     provider: String,
@@ -67,7 +66,7 @@ impl WebSearchTool {
         cache_ttl_minutes: u32,
     ) -> Self {
         let ttl = Duration::from_secs(u64::from(cache_ttl_minutes) * 60);
-        Self {
+        let tool = Self {
             provider: provider.trim().to_lowercase(),
             brave_api_key,
             perplexity_api_key,
@@ -79,83 +78,40 @@ impl WebSearchTool {
             timeout_secs: timeout_secs.max(1),
             freshness,
             cache: Arc::new(TtlCache::new(MAX_CACHE_ENTRIES, ttl)),
-        }
-    }
+        };
 
-    async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
-        // Use DDG Lite endpoint (POST form) — more reliable than html.duckduckgo.com
-        // which aggressively blocks non-browser TLS fingerprints (JA3/JA4).
-        let form_data = format!("q={}", urlencoding::encode(query));
-
-        let resp = super::curl_client::curl_post_form(
-            "https://lite.duckduckgo.com/lite/",
-            &form_data,
-            &[],
-            Duration::from_secs(self.timeout_secs),
-            Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
-            true,
-        )
-        .await?;
-
-        if resp.status < 200 || resp.status >= 300 {
-            anyhow::bail!("DuckDuckGo search failed with status: {}", resp.status);
-        }
-
-        self.parse_duckduckgo_results(&resp.body, query)
-    }
-
-    fn parse_duckduckgo_results(&self, html: &str, query: &str) -> anyhow::Result<String> {
-        // DDG Lite format uses simple table rows:
-        //   <a rel="nofollow" href="URL" class="result-link">Title</a>
-        //   <td class="result-snippet">Snippet text</td>
-        // Attribute order varies, so we match any <a> with class="result-link" and extract href separately.
-        let link_regex =
-            Regex::new(r#"<a[^>]*\bclass="result-link"[^>]*>([\s\S]*?)</a>"#)?;
-        let href_regex = Regex::new(r#"href="([^"]+)""#)?;
-
-        let snippet_regex = Regex::new(r#"<td[^>]*class="result-snippet"[^>]*>([\s\S]*?)</td>"#)?;
-
-        let link_matches: Vec<_> = link_regex
-            .captures_iter(html)
-            .take(self.max_results + 2)
-            .collect();
-
-        let snippet_matches: Vec<_> = snippet_regex
-            .captures_iter(html)
-            .take(self.max_results + 2)
-            .collect();
-
-        if link_matches.is_empty() {
-            return Ok(format!("No results found for: {}", query));
-        }
-
-        let mut lines = vec![format!("Search results for: {} (via DuckDuckGo)", query)];
-
-        let count = link_matches.len().min(self.max_results);
-
-        for i in 0..count {
-            let caps = &link_matches[i];
-            let full_tag = caps.get(0).map(|m| m.as_str()).unwrap_or("");
-            let url_str = href_regex
-                .captures(full_tag)
-                .and_then(|c| c.get(1))
-                .map(|m| m.as_str())
-                .unwrap_or("");
-            let title = strip_tags(&caps[1]);
-
-            lines.push(format!("{}. {}", i + 1, title.trim()));
-            lines.push(format!("   {}", url_str.trim()));
-
-            if i < snippet_matches.len() {
-                let snippet = strip_tags(&snippet_matches[i][1]);
-                let snippet = snippet.trim();
-                if !snippet.is_empty() {
-                    lines.push(format!("   {}", snippet));
-                }
+        // Log available providers at construction time
+        if tool.provider == "auto" {
+            let available = tool.available_providers();
+            if available.is_empty() {
+                tracing::warn!(
+                    "web_search provider=auto but no API keys configured. \
+                     Set BRAVE_API_KEY, PERPLEXITY_API_KEY, or GROK_API_KEY."
+                );
+            } else {
+                tracing::info!(
+                    providers = %available.join(", "),
+                    "web_search auto mode: available providers"
+                );
             }
         }
 
-        Ok(lines.join("\n"))
+        tool
+    }
+
+    /// Return list of providers that have API keys configured.
+    fn available_providers(&self) -> Vec<&str> {
+        let mut list = Vec::new();
+        if self.brave_api_key.is_some() {
+            list.push("brave");
+        }
+        if self.perplexity_api_key.is_some() {
+            list.push("perplexity");
+        }
+        if self.grok_api_key.is_some() {
+            list.push("grok");
+        }
+        list
     }
 
     /// Try providers in order, returning the first successful result.
@@ -189,12 +145,11 @@ impl WebSearchTool {
         freshness: Option<&str>,
     ) -> anyhow::Result<String> {
         match provider {
-            "duckduckgo" | "ddg" => self.search_duckduckgo(query).await,
             "brave" => self.search_brave(query, freshness).await,
             "perplexity" => self.search_perplexity(query, freshness).await,
             "grok" => self.search_grok(query).await,
             other => anyhow::bail!(
-                "Unknown search provider: {other}. Supported: auto, duckduckgo, brave, perplexity, grok"
+                "Unknown search provider: {other}. Supported: auto, brave, perplexity, grok"
             ),
         }
     }
@@ -442,11 +397,6 @@ impl WebSearchTool {
     }
 }
 
-fn strip_tags(content: &str) -> String {
-    let re = Regex::new(r"<[^>]+>").unwrap();
-    re.replace_all(content, "").to_string()
-}
-
 #[async_trait]
 impl Tool for WebSearchTool {
     fn name(&self) -> &str {
@@ -455,7 +405,7 @@ impl Tool for WebSearchTool {
 
     fn description(&self) -> &str {
         "Search the web for information. Returns relevant search results with titles, URLs, and descriptions. \
-        Supports providers: auto, duckduckgo, brave, perplexity, grok."
+        Supports providers: auto, brave, perplexity, grok."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -523,21 +473,21 @@ impl Tool for WebSearchTool {
 
         tracing::info!(provider = %self.provider, "Searching web for: {}", query);
 
-        // Build provider try-order: explicit provider first, then fallbacks for "auto" mode.
+        // Build provider try-order: explicit provider, or all configured for "auto".
         let providers: Vec<&str> = match self.provider.as_str() {
             "auto" => {
-                // Try all configured providers in priority order
-                let mut list = Vec::new();
-                if self.brave_api_key.is_some() {
-                    list.push("brave");
+                let list = self.available_providers();
+                if list.is_empty() {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(
+                            "No search providers configured. Set BRAVE_API_KEY, \
+                             PERPLEXITY_API_KEY, or GROK_API_KEY."
+                                .into(),
+                        ),
+                    });
                 }
-                if self.perplexity_api_key.is_some() {
-                    list.push("perplexity");
-                }
-                if self.grok_api_key.is_some() {
-                    list.push("grok");
-                }
-                list.push("duckduckgo");
                 list
             }
             p => vec![p],
@@ -578,84 +528,35 @@ mod tests {
 
     #[test]
     fn test_tool_name() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("brave".to_string(), None, 5, 15);
         assert_eq!(tool.name(), "web_search_tool");
     }
 
     #[test]
     fn test_tool_description() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("brave".to_string(), None, 5, 15);
         assert!(tool.description().contains("Search the web"));
     }
 
     #[test]
     fn test_parameters_schema() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("brave".to_string(), None, 5, 15);
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["query"].is_object());
         assert!(schema["properties"]["freshness"].is_object());
     }
 
-    #[test]
-    fn test_strip_tags() {
-        let html = "<b>Hello</b> <i>World</i>";
-        assert_eq!(strip_tags(html), "Hello World");
-    }
-
-    #[test]
-    fn test_parse_duckduckgo_results_empty() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
-        let result = tool
-            .parse_duckduckgo_results("<html>No results here</html>", "test")
-            .unwrap();
-        assert!(result.contains("No results found"));
-    }
-
-    #[test]
-    fn test_parse_duckduckgo_results_with_data() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
-        let html = r#"
-            <a rel="nofollow" href="https://example.com" class="result-link">Example Title</a>
-            <td class="result-snippet">This is a description</td>
-        "#;
-        let result = tool.parse_duckduckgo_results(html, "test").unwrap();
-        assert!(result.contains("Example Title"));
-        assert!(result.contains("https://example.com"));
-    }
-
-    #[test]
-    fn test_parse_duckduckgo_results_direct_urls() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
-        let html = r#"
-            <a rel="nofollow" href="https://example.com/path?a=1" class="result-link">Example Title</a>
-            <td class="result-snippet">This is a description</td>
-        "#;
-        let result = tool.parse_duckduckgo_results(html, "test").unwrap();
-        assert!(result.contains("https://example.com/path?a=1"));
-    }
-
-    #[test]
-    fn test_constructor_clamps_web_search_limits() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 0, 0);
-        let html = r#"
-            <a rel="nofollow" href="https://example.com" class="result-link">Example Title</a>
-            <td class="result-snippet">This is a description</td>
-        "#;
-        let result = tool.parse_duckduckgo_results(html, "test").unwrap();
-        assert!(result.contains("Example Title"));
-    }
-
     #[tokio::test]
     async fn test_execute_missing_query() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("brave".to_string(), None, 5, 15);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_execute_empty_query() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("brave".to_string(), None, 5, 15);
         let result = tool.execute(json!({"query": ""})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("empty"));
@@ -727,5 +628,41 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("Unknown search provider"));
+    }
+
+    #[tokio::test]
+    async fn test_auto_mode_no_keys_configured() {
+        let tool = WebSearchTool::with_all_providers(
+            "auto".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            5,
+            15,
+            None,
+            15,
+        );
+        let result = tool.execute(json!({"query": "test"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("No search providers configured"));
+    }
+
+    #[test]
+    fn test_available_providers_none() {
+        let tool = WebSearchTool::new("auto".to_string(), None, 5, 15);
+        assert!(tool.available_providers().is_empty());
+    }
+
+    #[test]
+    fn test_available_providers_brave_only() {
+        let tool = WebSearchTool::new("auto".to_string(), Some("key".into()), 5, 15);
+        assert_eq!(tool.available_providers(), vec!["brave"]);
     }
 }

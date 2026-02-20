@@ -991,8 +991,7 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Search provider: "auto" (try configured APIs first, DDG fallback),
-    /// "duckduckgo", "brave", "perplexity", or "grok"
+    /// Search provider: "auto" (try all configured APIs), "brave", "perplexity", or "grok"
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
     /// Brave Search API key (required if provider is "brave")
