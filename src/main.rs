@@ -557,6 +557,19 @@ async fn main() -> Result<()> {
     config.apply_env_overrides();
 
     // Initialize full logging subscriber (stderr + optional file layer)
+    // Build a target-aware filter when the configured level is a bare keyword (e.g. "debug").
+    // This suppresses noisy HTTP/TLS internals while keeping zeroclaw at the requested level.
+    let build_env_filter = |level: &str| -> String {
+        let bare_levels = ["error", "warn", "info", "debug", "trace"];
+        if bare_levels.contains(&level.to_lowercase().as_str()) {
+            format!(
+                "{level},zeroclaw={level},hyper_util=warn,hyper=warn,h2=warn,rustls=warn,reqwest=warn,tungstenite=warn"
+            )
+        } else {
+            level.to_string()
+        }
+    };
+
     let file_logging = is_daemon || config.logging.file_logging;
     let _log_guard = if file_logging {
         let log_dir = &config.logging.log_dir;
@@ -575,8 +588,9 @@ async fn main() -> Result<()> {
             .expect("failed to create log file appender");
 
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-        let env_filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
+        let filter_input = std::env::var("RUST_LOG")
+            .unwrap_or_else(|_| config.logging.level.clone());
+        let env_filter = EnvFilter::new(build_env_filter(&filter_input));
         let subscriber = tracing_subscriber::registry()
             .with(env_filter)
             .with(fmt::layer().with_ansi(true))
@@ -585,8 +599,9 @@ async fn main() -> Result<()> {
             .expect("setting default subscriber failed");
         Some(guard)
     } else {
-        let env_filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
+        let filter_input = std::env::var("RUST_LOG")
+            .unwrap_or_else(|_| config.logging.level.clone());
+        let env_filter = EnvFilter::new(build_env_filter(&filter_input));
         let subscriber = fmt::Subscriber::builder()
             .with_env_filter(env_filter)
             .finish();

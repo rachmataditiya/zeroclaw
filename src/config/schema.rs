@@ -1735,7 +1735,7 @@ impl Default for LoggingConfig {
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
-            backend: "none".into(),
+            backend: "log".into(),
             otel_endpoint: None,
             otel_service_name: None,
         }
@@ -3518,7 +3518,7 @@ mod tests {
     #[test]
     fn observability_config_default() {
         let o = ObservabilityConfig::default();
-        assert_eq!(o.backend, "none");
+        assert_eq!(o.backend, "log");
     }
 
     #[test]
@@ -3735,7 +3735,7 @@ default_temperature = 0.7
         let parsed: Config = toml::from_str(minimal).unwrap();
         assert!(parsed.api_key.is_none());
         assert!(parsed.default_provider.is_none());
-        assert_eq!(parsed.observability.backend, "none");
+        assert_eq!(parsed.observability.backend, "log");
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Supervised);
         assert_eq!(parsed.runtime.kind, "native");
         assert!(!parsed.heartbeat.enabled);

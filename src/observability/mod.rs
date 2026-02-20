@@ -45,7 +45,13 @@ pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
                 }
             }
         }
-        "none" | "noop" => Box::new(NoopObserver),
+        "none" | "noop" => {
+            tracing::warn!(
+                "Observability backend is 'none' — agent flow events (llm.request, tool.call, etc.) \
+                 will not be logged. Set [observability] backend = \"log\" in config.toml to enable."
+            );
+            Box::new(NoopObserver)
+        }
         _ => {
             tracing::warn!(
                 "Unknown observability backend '{}', falling back to noop",
