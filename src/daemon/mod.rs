@@ -354,7 +354,8 @@ async fn run_event_processor(config: Config) -> Result<()> {
         .collect();
 
     let mut processor =
-        crate::events::EventProcessor::new(sources, agent_context, routes, observer);
+        crate::events::EventProcessor::new(sources, agent_context, routes, observer)
+            .with_skills(skills);
 
     processor.run().await
 }

@@ -95,6 +95,7 @@ pub struct EventProcessor {
     agent_context: Arc<WebhookAgentContext>,
     routes: Vec<EventRoute>,
     observer: Arc<dyn crate::observability::Observer>,
+    skills: Vec<crate::skills::Skill>,
 }
 
 impl EventProcessor {
@@ -109,7 +110,14 @@ impl EventProcessor {
             agent_context,
             routes,
             observer,
+            skills: Vec::new(),
         }
+    }
+
+    /// Attach loaded skills so event routes can inject skill-specific instructions.
+    pub fn with_skills(mut self, skills: Vec<crate::skills::Skill>) -> Self {
+        self.skills = skills;
+        self
     }
 
     /// Run the event processing loop. Connects all sources and processes events.
@@ -230,10 +238,45 @@ impl EventProcessor {
             "Processing event"
         );
 
+        // Inject skill-specific instructions when the route targets a named skill.
+        let final_prompt = if let Some(name) = skill_name {
+            if let Some(skill) = self.skills.iter().find(|s| s.name == name) {
+                use std::fmt::Write;
+                let mut enriched = String::with_capacity(prompt.len() + 512);
+                let _ = writeln!(enriched, "[Skill: {}]", skill.name);
+                if !skill.prompts.is_empty() {
+                    enriched.push_str("[Instructions]\n");
+                    for instruction in &skill.prompts {
+                        enriched.push_str(instruction);
+                        enriched.push('\n');
+                    }
+                    enriched.push('\n');
+                }
+                if !skill.tools.is_empty() {
+                    enriched.push_str("[Skill tools]\n");
+                    for tool in &skill.tools {
+                        let _ = writeln!(
+                            enriched,
+                            "- {} ({}): {}",
+                            tool.name, tool.kind, tool.description
+                        );
+                    }
+                    enriched.push('\n');
+                }
+                enriched.push_str(&prompt);
+                enriched
+            } else {
+                tracing::warn!(skill = name, "Route references unknown skill");
+                prompt
+            }
+        } else {
+            prompt
+        };
+
         // Run the agent with the formatted prompt
         let _response = self
             .agent_context
-            .process_message(&prompt, Some(source_name), None)
+            .process_message(&final_prompt, Some(source_name), None)
             .await?;
 
         Ok(())
