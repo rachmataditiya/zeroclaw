@@ -1,7 +1,11 @@
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::auth::AuthService;
-use crate::providers::traits::Provider;
+use crate::providers::traits::{
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
+    Provider, ProviderCapabilities, ToolCall as ProviderToolCall,
+};
 use crate::providers::ProviderRuntimeOptions;
+use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -21,7 +25,7 @@ pub struct OpenAiCodexProvider {
 #[derive(Debug, Serialize)]
 struct ResponsesRequest {
     model: String,
-    input: Vec<ResponsesInput>,
+    input: Vec<ResponsesInputItem>,
     instructions: String,
     store: bool,
     stream: bool,
@@ -30,6 +34,8 @@ struct ResponsesRequest {
     include: Vec<String>,
     tool_choice: String,
     parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ResponsesToolSpec>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,6 +62,40 @@ struct ResponsesReasoningOptions {
     summary: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ResponsesToolSpec {
+    #[serde(rename = "type")]
+    kind: String,
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesFunctionCallInput {
+    #[serde(rename = "type")]
+    kind: String,
+    call_id: String,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesFunctionCallOutput {
+    #[serde(rename = "type")]
+    kind: String,
+    call_id: String,
+    output: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ResponsesInputItem {
+    Message(ResponsesInput),
+    FunctionCall(ResponsesFunctionCallInput),
+    FunctionCallOutput(ResponsesFunctionCallOutput),
+}
+
 #[derive(Debug, Deserialize)]
 struct ResponsesResponse {
     #[serde(default)]
@@ -66,8 +106,16 @@ struct ResponsesResponse {
 
 #[derive(Debug, Deserialize)]
 struct ResponsesOutput {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
     #[serde(default)]
     content: Vec<ResponsesContent>,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -310,6 +358,285 @@ fn extract_stream_error_message(event: &Value) -> Option<String> {
     None
 }
 
+fn convert_tools_to_responses(tools: Option<&[ToolSpec]>) -> Option<Vec<ResponsesToolSpec>> {
+    tools.map(|items| {
+        items
+            .iter()
+            .map(|tool| ResponsesToolSpec {
+                kind: "function".to_string(),
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
+            })
+            .collect()
+    })
+}
+
+fn convert_messages_to_responses(messages: &[ChatMessage]) -> Vec<ResponsesInputItem> {
+    let mut items = Vec::new();
+
+    for msg in messages {
+        match msg.role.as_str() {
+            "system" => {
+                // System messages go to `instructions` field, skip from input.
+            }
+            "user" => {
+                items.push(ResponsesInputItem::Message(ResponsesInput {
+                    role: "user".to_string(),
+                    content: vec![ResponsesInputContent {
+                        kind: "input_text".to_string(),
+                        text: msg.content.clone(),
+                    }],
+                }));
+            }
+            "assistant" => {
+                // The agent loop stores assistant messages with tool calls as JSON:
+                // {"content": "text or null", "tool_calls": [{"id": "...", "name": "...", "arguments": "..."}]}
+                if let Ok(value) = serde_json::from_str::<Value>(&msg.content) {
+                    if let Some(tool_calls_value) = value.get("tool_calls") {
+                        if let Ok(parsed_calls) = serde_json::from_value::<Vec<ProviderToolCall>>(
+                            tool_calls_value.clone(),
+                        ) {
+                            // Emit assistant text as a message if present.
+                            if let Some(text) = value
+                                .get("content")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                            {
+                                items.push(ResponsesInputItem::Message(ResponsesInput {
+                                    role: "assistant".to_string(),
+                                    content: vec![ResponsesInputContent {
+                                        kind: "output_text".to_string(),
+                                        text: text.to_string(),
+                                    }],
+                                }));
+                            }
+                            // Emit each tool call as a function_call input item.
+                            for tc in parsed_calls {
+                                items.push(ResponsesInputItem::FunctionCall(
+                                    ResponsesFunctionCallInput {
+                                        kind: "function_call".to_string(),
+                                        call_id: tc.id,
+                                        name: tc.name,
+                                        arguments: tc.arguments,
+                                    },
+                                ));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                // Plain assistant message (no tool calls).
+                items.push(ResponsesInputItem::Message(ResponsesInput {
+                    role: "assistant".to_string(),
+                    content: vec![ResponsesInputContent {
+                        kind: "output_text".to_string(),
+                        text: msg.content.clone(),
+                    }],
+                }));
+            }
+            "tool" => {
+                // Tool result messages from the agent loop:
+                // {"tool_call_id": "call_123", "content": "result text"}
+                if let Ok(value) = serde_json::from_str::<Value>(&msg.content) {
+                    let call_id = value
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let output = value
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    items.push(ResponsesInputItem::FunctionCallOutput(
+                        ResponsesFunctionCallOutput {
+                            kind: "function_call_output".to_string(),
+                            call_id,
+                            output,
+                        },
+                    ));
+                }
+            }
+            _ => {
+                // Unknown role — pass as user message to avoid dropping content.
+                items.push(ResponsesInputItem::Message(ResponsesInput {
+                    role: "user".to_string(),
+                    content: vec![ResponsesInputContent {
+                        kind: "input_text".to_string(),
+                        text: msg.content.clone(),
+                    }],
+                }));
+            }
+        }
+    }
+
+    items
+}
+
+fn extract_responses_tool_calls(response: &ResponsesResponse) -> Vec<ProviderToolCall> {
+    response
+        .output
+        .iter()
+        .filter(|item| item.kind.as_deref() == Some("function_call"))
+        .filter_map(|item| {
+            let call_id = item.call_id.as_ref()?;
+            let name = item.name.as_ref()?;
+            let arguments = item.arguments.as_ref()?;
+            Some(ProviderToolCall {
+                id: call_id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            })
+        })
+        .collect()
+}
+
+fn extract_stream_event_full(
+    event: &Value,
+    saw_delta: bool,
+) -> (Option<String>, Vec<ProviderToolCall>) {
+    let event_type = event.get("type").and_then(Value::as_str);
+    match event_type {
+        Some("response.output_text.delta") => (
+            nonempty_preserve(event.get("delta").and_then(Value::as_str)),
+            Vec::new(),
+        ),
+        Some("response.output_text.done") if !saw_delta => (
+            nonempty_preserve(event.get("text").and_then(Value::as_str)),
+            Vec::new(),
+        ),
+        Some("response.completed" | "response.done") => {
+            if let Some(resp) = event
+                .get("response")
+                .and_then(|v| serde_json::from_value::<ResponsesResponse>(v.clone()).ok())
+            {
+                let text = extract_responses_text(&resp);
+                let tool_calls = extract_responses_tool_calls(&resp);
+                (text, tool_calls)
+            } else {
+                (None, Vec::new())
+            }
+        }
+        _ => (None, Vec::new()),
+    }
+}
+
+fn parse_sse_full(body: &str) -> anyhow::Result<(Option<String>, Vec<ProviderToolCall>)> {
+    let mut saw_delta = false;
+    let mut delta_accumulator = String::new();
+    let mut fallback_text = None;
+    let mut tool_calls = Vec::new();
+    let mut buffer = body.to_string();
+
+    let mut process_event = |event: Value| -> anyhow::Result<()> {
+        if let Some(message) = extract_stream_error_message(&event) {
+            return Err(anyhow::anyhow!("OpenAI Codex stream error: {message}"));
+        }
+        let (text, calls) = extract_stream_event_full(&event, saw_delta);
+        if !calls.is_empty() {
+            tool_calls = calls;
+        }
+        if let Some(text) = text {
+            let event_type = event.get("type").and_then(Value::as_str);
+            if event_type == Some("response.output_text.delta") {
+                saw_delta = true;
+                delta_accumulator.push_str(&text);
+            } else if fallback_text.is_none() {
+                fallback_text = Some(text);
+            }
+        }
+        Ok(())
+    };
+
+    let mut process_chunk = |chunk: &str| -> anyhow::Result<()> {
+        let data_lines: Vec<String> = chunk
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|line| line.trim().to_string())
+            .collect();
+        if data_lines.is_empty() {
+            return Ok(());
+        }
+
+        let joined = data_lines.join("\n");
+        let trimmed = joined.trim();
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            return Ok(());
+        }
+
+        if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
+            return process_event(event);
+        }
+
+        for line in data_lines {
+            let line = line.trim();
+            if line.is_empty() || line == "[DONE]" {
+                continue;
+            }
+            if let Ok(event) = serde_json::from_str::<Value>(line) {
+                process_event(event)?;
+            }
+        }
+
+        Ok(())
+    };
+
+    loop {
+        let Some(idx) = buffer.find("\n\n") else {
+            break;
+        };
+        let chunk = buffer[..idx].to_string();
+        buffer = buffer[idx + 2..].to_string();
+        process_chunk(&chunk)?;
+    }
+
+    if !buffer.trim().is_empty() {
+        process_chunk(&buffer)?;
+    }
+
+    let text = if saw_delta {
+        nonempty_preserve(Some(&delta_accumulator))
+    } else {
+        fallback_text
+    };
+
+    Ok((text, tool_calls))
+}
+
+async fn decode_responses_body_full(
+    response: reqwest::Response,
+) -> anyhow::Result<(Option<String>, Vec<ProviderToolCall>)> {
+    let body = response.text().await?;
+
+    let (text, tool_calls) = parse_sse_full(&body)?;
+    if text.is_some() || !tool_calls.is_empty() {
+        return Ok((text, tool_calls));
+    }
+
+    let body_trimmed = body.trim_start();
+    let looks_like_sse = body_trimmed.starts_with("event:") || body_trimmed.starts_with("data:");
+    if looks_like_sse {
+        return Err(anyhow::anyhow!(
+            "No response from OpenAI Codex stream payload: {}",
+            super::sanitize_api_error(&body)
+        ));
+    }
+
+    let parsed: ResponsesResponse = serde_json::from_str(&body).map_err(|err| {
+        anyhow::anyhow!(
+            "OpenAI Codex JSON parse failed: {err}. Payload: {}",
+            super::sanitize_api_error(&body)
+        )
+    })?;
+    let text = extract_responses_text(&parsed);
+    let tool_calls = extract_responses_tool_calls(&parsed);
+    if text.is_some() || !tool_calls.is_empty() {
+        return Ok((text, tool_calls));
+    }
+    Err(anyhow::anyhow!("No response from OpenAI Codex"))
+}
+
 async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<String> {
     let body = response.text().await?;
 
@@ -368,13 +695,13 @@ impl Provider for OpenAiCodexProvider {
 
         let request = ResponsesRequest {
             model: normalized_model.to_string(),
-            input: vec![ResponsesInput {
+            input: vec![ResponsesInputItem::Message(ResponsesInput {
                 role: "user".to_string(),
                 content: vec![ResponsesInputContent {
                     kind: "input_text".to_string(),
                     text: message.to_string(),
                 }],
-            }],
+            })],
             instructions: resolve_instructions(system_prompt),
             store: false,
             stream: true,
@@ -388,6 +715,7 @@ impl Provider for OpenAiCodexProvider {
             include: vec!["reasoning.encrypted_content".to_string()],
             tool_choice: "auto".to_string(),
             parallel_tool_calls: true,
+            tools: None,
         };
 
         let response = self
@@ -409,6 +737,94 @@ impl Provider for OpenAiCodexProvider {
 
         decode_responses_body(response).await
     }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+        }
+    }
+
+    async fn chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let profile = self
+            .auth
+            .get_profile("openai-codex", self.auth_profile_override.as_deref())?;
+        let access_token = self
+            .auth
+            .get_valid_openai_access_token(self.auth_profile_override.as_deref())
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`."
+                )
+            })?;
+        let account_id = profile
+            .and_then(|p| p.account_id)
+            .or_else(|| extract_account_id_from_jwt(&access_token))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again."
+                )
+            })?;
+        let normalized_model = normalize_model_id(model);
+
+        // Extract system prompt from messages for the `instructions` field.
+        let system_prompt = request
+            .messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.as_str());
+
+        let input = convert_messages_to_responses(request.messages);
+        let tools = convert_tools_to_responses(request.tools);
+
+        let api_request = ResponsesRequest {
+            model: normalized_model.to_string(),
+            input,
+            instructions: resolve_instructions(system_prompt),
+            store: false,
+            stream: true,
+            text: ResponsesTextOptions {
+                verbosity: "medium".to_string(),
+            },
+            reasoning: ResponsesReasoningOptions {
+                effort: resolve_reasoning_effort(normalized_model),
+                summary: "auto".to_string(),
+            },
+            include: vec!["reasoning.encrypted_content".to_string()],
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: true,
+            tools,
+        };
+
+        let response = self
+            .client
+            .post(CODEX_RESPONSES_URL)
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("chatgpt-account-id", &account_id)
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("originator", "pi")
+            .header("accept", "text/event-stream")
+            .header("Content-Type", "application/json")
+            .json(&api_request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenAI Codex", response).await);
+        }
+
+        let (text, tool_calls) = decode_responses_body_full(response).await?;
+        Ok(ProviderChatResponse {
+            text,
+            tool_calls,
+            reasoning_content: None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -428,10 +844,14 @@ mod tests {
     fn extracts_nested_output_text() {
         let response = ResponsesResponse {
             output: vec![ResponsesOutput {
+                kind: Some("message".into()),
                 content: vec![ResponsesContent {
                     kind: Some("output_text".into()),
                     text: Some("nested".into()),
                 }],
+                call_id: None,
+                name: None,
+                arguments: None,
             }],
             output_text: None,
         };
@@ -515,5 +935,237 @@ data: [DONE]
 "#;
 
         assert_eq!(parse_sse_text(payload).unwrap().as_deref(), Some("Done"));
+    }
+
+    #[test]
+    fn convert_tools_to_responses_maps_fields() {
+        let tools = vec![ToolSpec {
+            name: "shell".to_string(),
+            description: "Execute commands".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {"cmd": {"type": "string"}}}),
+        }];
+        let result = convert_tools_to_responses(Some(&tools)).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].kind, "function");
+        assert_eq!(result[0].name, "shell");
+        assert_eq!(result[0].description, "Execute commands");
+        assert!(result[0].parameters.get("properties").is_some());
+    }
+
+    #[test]
+    fn convert_tools_to_responses_none_for_none() {
+        assert!(convert_tools_to_responses(None).is_none());
+    }
+
+    #[test]
+    fn convert_messages_skips_system() {
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("Hello"),
+        ];
+        let items = convert_messages_to_responses(&messages);
+        assert_eq!(items.len(), 1);
+        // Should be the user message, not system.
+        let json = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(json["role"], "user");
+    }
+
+    #[test]
+    fn convert_messages_handles_user() {
+        let messages = vec![ChatMessage::user("What is Rust?")];
+        let items = convert_messages_to_responses(&messages);
+        assert_eq!(items.len(), 1);
+        let json = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(json["role"], "user");
+        assert_eq!(json["content"][0]["type"], "input_text");
+        assert_eq!(json["content"][0]["text"], "What is Rust?");
+    }
+
+    #[test]
+    fn convert_messages_handles_assistant_with_tool_calls() {
+        let assistant_content = serde_json::json!({
+            "content": "Let me check",
+            "tool_calls": [
+                {"id": "call_abc", "name": "shell", "arguments": "{\"cmd\":\"ls\"}"}
+            ]
+        })
+        .to_string();
+        let messages = vec![ChatMessage::assistant(assistant_content)];
+        let items = convert_messages_to_responses(&messages);
+
+        // Should produce: 1 assistant text message + 1 function call item.
+        assert_eq!(items.len(), 2);
+
+        let text_json = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(text_json["role"], "assistant");
+        assert_eq!(text_json["content"][0]["text"], "Let me check");
+
+        let call_json = serde_json::to_value(&items[1]).unwrap();
+        assert_eq!(call_json["type"], "function_call");
+        assert_eq!(call_json["call_id"], "call_abc");
+        assert_eq!(call_json["name"], "shell");
+    }
+
+    #[test]
+    fn convert_messages_handles_assistant_with_null_content() {
+        let assistant_content = serde_json::json!({
+            "content": null,
+            "tool_calls": [
+                {"id": "call_1", "name": "file_read", "arguments": "{}"}
+            ]
+        })
+        .to_string();
+        let messages = vec![ChatMessage::assistant(assistant_content)];
+        let items = convert_messages_to_responses(&messages);
+
+        // Only the function call, no text message (content was null).
+        assert_eq!(items.len(), 1);
+        let json = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(json["type"], "function_call");
+    }
+
+    #[test]
+    fn convert_messages_handles_tool_results() {
+        let tool_content = serde_json::json!({
+            "tool_call_id": "call_abc",
+            "content": "file contents here"
+        })
+        .to_string();
+        let messages = vec![ChatMessage::tool(tool_content)];
+        let items = convert_messages_to_responses(&messages);
+        assert_eq!(items.len(), 1);
+        let json = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(json["type"], "function_call_output");
+        assert_eq!(json["call_id"], "call_abc");
+        assert_eq!(json["output"], "file contents here");
+    }
+
+    #[test]
+    fn convert_messages_full_conversation() {
+        let messages = vec![
+            ChatMessage::system("Be helpful"),
+            ChatMessage::user("List files"),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": null,
+                    "tool_calls": [{"id": "call_1", "name": "shell", "arguments": "{\"cmd\":\"ls\"}"}]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({"tool_call_id": "call_1", "content": "file1.txt\nfile2.txt"})
+                    .to_string(),
+            ),
+        ];
+        let items = convert_messages_to_responses(&messages);
+
+        // system skipped, user=1, function_call=1, function_call_output=1 => 3
+        assert_eq!(items.len(), 3);
+
+        let json0 = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(json0["role"], "user");
+
+        let json1 = serde_json::to_value(&items[1]).unwrap();
+        assert_eq!(json1["type"], "function_call");
+
+        let json2 = serde_json::to_value(&items[2]).unwrap();
+        assert_eq!(json2["type"], "function_call_output");
+    }
+
+    #[test]
+    fn extract_responses_tool_calls_parses_function_calls() {
+        let response = ResponsesResponse {
+            output: vec![
+                ResponsesOutput {
+                    kind: Some("message".into()),
+                    content: vec![ResponsesContent {
+                        kind: Some("output_text".into()),
+                        text: Some("I'll check".into()),
+                    }],
+                    call_id: None,
+                    name: None,
+                    arguments: None,
+                },
+                ResponsesOutput {
+                    kind: Some("function_call".into()),
+                    content: vec![],
+                    call_id: Some("call_xyz".into()),
+                    name: Some("shell".into()),
+                    arguments: Some(r#"{"cmd":"ls"}"#.into()),
+                },
+            ],
+            output_text: Some("I'll check".into()),
+        };
+
+        let calls = extract_responses_tool_calls(&response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_xyz");
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments, r#"{"cmd":"ls"}"#);
+    }
+
+    #[test]
+    fn responses_input_item_serializes_correctly() {
+        let message = ResponsesInputItem::Message(ResponsesInput {
+            role: "user".to_string(),
+            content: vec![ResponsesInputContent {
+                kind: "input_text".to_string(),
+                text: "hello".to_string(),
+            }],
+        });
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["role"], "user");
+        assert_eq!(json["content"][0]["type"], "input_text");
+
+        let call = ResponsesInputItem::FunctionCall(ResponsesFunctionCallInput {
+            kind: "function_call".to_string(),
+            call_id: "call_1".to_string(),
+            name: "shell".to_string(),
+            arguments: "{}".to_string(),
+        });
+        let json = serde_json::to_value(&call).unwrap();
+        assert_eq!(json["type"], "function_call");
+        assert_eq!(json["call_id"], "call_1");
+        assert!(json.get("role").is_none());
+
+        let output = ResponsesInputItem::FunctionCallOutput(ResponsesFunctionCallOutput {
+            kind: "function_call_output".to_string(),
+            call_id: "call_1".to_string(),
+            output: "result".to_string(),
+        });
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(json["type"], "function_call_output");
+        assert_eq!(json["output"], "result");
+    }
+
+    #[test]
+    fn parse_sse_full_response_with_tool_calls() {
+        let payload = format!(
+            "data: {}\n\ndata: [DONE]\n",
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "Let me check"}]
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": "call_99",
+                            "name": "file_read",
+                            "arguments": "{\"path\":\"test.rs\"}"
+                        }
+                    ],
+                    "output_text": "Let me check"
+                }
+            })
+        );
+
+        let (text, tool_calls) = parse_sse_full(&payload).unwrap();
+        assert_eq!(text.as_deref(), Some("Let me check"));
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_99");
+        assert_eq!(tool_calls[0].name, "file_read");
     }
 }
