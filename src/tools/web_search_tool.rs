@@ -158,6 +158,47 @@ impl WebSearchTool {
         Ok(lines.join("\n"))
     }
 
+    /// Try providers in order, returning the first successful result.
+    /// Collects errors and returns a combined message if all fail.
+    async fn try_providers(
+        &self,
+        providers: &[&str],
+        query: &str,
+        freshness: Option<&str>,
+    ) -> Result<String, String> {
+        let mut errors = Vec::new();
+
+        for &provider in providers {
+            match self.search_single(provider, query, freshness).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    tracing::warn!(provider, error = %e, "Search provider failed, trying next");
+                    errors.push(format!("{provider}: {e:#}"));
+                }
+            }
+        }
+
+        Err(errors.join("; "))
+    }
+
+    /// Dispatch a search to a single provider by name.
+    async fn search_single(
+        &self,
+        provider: &str,
+        query: &str,
+        freshness: Option<&str>,
+    ) -> anyhow::Result<String> {
+        match provider {
+            "duckduckgo" | "ddg" => self.search_duckduckgo(query).await,
+            "brave" => self.search_brave(query, freshness).await,
+            "perplexity" => self.search_perplexity(query, freshness).await,
+            "grok" => self.search_grok(query).await,
+            other => anyhow::bail!(
+                "Unknown search provider: {other}. Supported: auto, duckduckgo, brave, perplexity, grok"
+            ),
+        }
+    }
+
     async fn search_brave(&self, query: &str, freshness: Option<&str>) -> anyhow::Result<String> {
         let api_key = self
             .brave_api_key
@@ -414,7 +455,7 @@ impl Tool for WebSearchTool {
 
     fn description(&self) -> &str {
         "Search the web for information. Returns relevant search results with titles, URLs, and descriptions. \
-        Supports providers: duckduckgo, brave, perplexity, grok."
+        Supports providers: auto, duckduckgo, brave, perplexity, grok."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -482,54 +523,37 @@ impl Tool for WebSearchTool {
 
         tracing::info!(provider = %self.provider, "Searching web for: {}", query);
 
-        let result = match self.provider.as_str() {
-            "duckduckgo" | "ddg" => match self.search_duckduckgo(query).await {
-                Ok(r) => r,
-                Err(e) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("DuckDuckGo search failed: {e:#}")),
-                    });
+        // Build provider try-order: explicit provider first, then fallbacks for "auto" mode.
+        let providers: Vec<&str> = match self.provider.as_str() {
+            "auto" => {
+                // Try all configured providers in priority order
+                let mut list = Vec::new();
+                if self.brave_api_key.is_some() {
+                    list.push("brave");
                 }
-            },
-            "brave" => match self.search_brave(query, freshness.as_deref()).await {
-                Ok(r) => r,
-                Err(e) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Brave search failed: {e:#}")),
-                    });
+                if self.perplexity_api_key.is_some() {
+                    list.push("perplexity");
                 }
-            },
-            "perplexity" => match self.search_perplexity(query, freshness.as_deref()).await {
-                Ok(r) => r,
-                Err(e) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Perplexity search failed: {e:#}")),
-                    });
+                if self.grok_api_key.is_some() {
+                    list.push("grok");
                 }
-            },
-            "grok" => match self.search_grok(query).await {
-                Ok(r) => r,
-                Err(e) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Grok search failed: {e:#}")),
-                    });
-                }
-            },
-            other => {
+                list.push("duckduckgo");
+                list
+            }
+            p => vec![p],
+        };
+
+        let result = self
+            .try_providers(&providers, query, freshness.as_deref())
+            .await;
+
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!(
-                        "Unknown search provider: {other}. Supported: duckduckgo, brave, perplexity, grok"
-                    )),
+                    error: Some(e),
                 });
             }
         };
