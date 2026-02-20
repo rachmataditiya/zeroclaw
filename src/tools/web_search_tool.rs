@@ -205,20 +205,26 @@ impl WebSearchTool {
         let mut lines = vec![format!("Search results for: {} (via Brave)", query)];
 
         for (i, result) in results.iter().take(self.max_results).enumerate() {
-            let title = result
-                .get("title")
-                .and_then(|t| t.as_str())
-                .unwrap_or("No title");
+            let title = strip_html_tags(
+                result
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("No title"),
+            );
             let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
-            let description = result
-                .get("description")
-                .and_then(|d| d.as_str())
-                .unwrap_or("");
+            let description = strip_html_tags(
+                result
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or(""),
+            );
 
-            lines.push(format!("{}. {}", i + 1, title));
+            lines.push(format!("{}. {}", i + 1, title.trim()));
             lines.push(format!("   {}", url));
             if !description.is_empty() {
-                lines.push(format!("   {}", description));
+                // Truncate long descriptions to save tokens
+                let desc = truncate_str(description.trim(), 200);
+                lines.push(format!("   {desc}"));
             }
         }
 
@@ -395,6 +401,42 @@ impl WebSearchTool {
 
         Ok(result)
     }
+}
+
+/// Strip HTML tags from a string, decoding common entities.
+fn strip_html_tags(s: &str) -> String {
+    // Remove tags
+    let mut result = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => result.push(ch),
+            _ => {}
+        }
+    }
+    // Decode common HTML entities
+    result
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+}
+
+/// Truncate a string to `max_chars`, appending "..." if truncated.
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.len() <= max_chars {
+        return s.to_string();
+    }
+    // Find a char boundary near max_chars
+    let mut end = max_chars;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
 }
 
 #[async_trait]
