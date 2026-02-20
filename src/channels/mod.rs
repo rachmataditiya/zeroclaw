@@ -1560,7 +1560,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let mut tools_vec = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -1573,7 +1573,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    ));
+    );
+    tools::extend_with_mcp(&mut tools_vec, &config.mcp).await;
+    let tools_registry = Arc::new(tools_vec);
 
     let skills = crate::skills::load_skills(&workspace);
 
@@ -1631,6 +1633,28 @@ pub async fn start_channels(config: Config) -> Result<()> {
             "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt and returns its response.",
         ));
     }
+
+    // Collect MCP tool descriptions into owned storage so they can be
+    // borrowed into `tool_descs` alongside the static entries.
+    let mcp_tool_desc_storage: Vec<(String, String)> = if config.mcp.enabled {
+        tools_registry
+            .iter()
+            .filter(|t| {
+                let name = t.name();
+                name.starts_with("mcp__")
+                    || name == "mcp_list_servers"
+                    || name == "mcp_server_tools"
+            })
+            .map(|t| (t.name().to_string(), t.description().to_string()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mcp_tool_desc_refs: Vec<(&str, &str)> = mcp_tool_desc_storage
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_str()))
+        .collect();
+    tool_descs.extend(mcp_tool_desc_refs);
 
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)

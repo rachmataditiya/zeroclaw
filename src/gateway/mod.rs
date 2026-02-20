@@ -444,7 +444,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let mut tools_vec = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -457,7 +457,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    ));
+    );
+    tools::extend_with_mcp(&mut tools_vec, &config.mcp).await;
+    let tools_registry = Arc::new(tools_vec);
 
     // Build full agent context for webhook processing
     let agent_context = {

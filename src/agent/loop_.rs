@@ -1404,19 +1404,7 @@ pub async fn run(
     }
 
     // ── MCP servers (connect + extend registry) ──
-    if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        let manager = std::sync::Arc::new(crate::mcp::McpManager::new(config.mcp.clone()));
-        if let Err(e) = manager.connect_all().await {
-            tracing::warn!("MCP server connection errors: {e}");
-        }
-        tools_registry.push(Box::new(tools::McpListServersTool::new(manager.clone())));
-        tools_registry.push(Box::new(tools::McpServerToolsTool::new(manager.clone())));
-        let mcp_tools = manager.create_proxy_tools(manager.clone());
-        if !mcp_tools.is_empty() {
-            tracing::info!(count = mcp_tools.len(), "MCP proxy tools added");
-        }
-        tools_registry.extend(mcp_tools);
-    }
+    tools::extend_with_mcp(&mut tools_registry, &config.mcp).await;
 
     // Collect MCP tool descriptions into owned storage so they can be
     // borrowed into `tool_descs` alongside the static entries.
@@ -1954,19 +1942,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     tools_registry.extend(peripheral_tools);
 
     // ── MCP servers (connect + extend registry) ──
-    if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        let manager = std::sync::Arc::new(crate::mcp::McpManager::new(config.mcp.clone()));
-        if let Err(e) = manager.connect_all().await {
-            tracing::warn!("MCP server connection errors: {e}");
-        }
-        tools_registry.push(Box::new(tools::McpListServersTool::new(manager.clone())));
-        tools_registry.push(Box::new(tools::McpServerToolsTool::new(manager.clone())));
-        let mcp_tools = manager.create_proxy_tools(manager.clone());
-        if !mcp_tools.is_empty() {
-            tracing::info!(count = mcp_tools.len(), "MCP proxy tools added");
-        }
-        tools_registry.extend(mcp_tools);
-    }
+    tools::extend_with_mcp(&mut tools_registry, &config.mcp).await;
 
     // Collect MCP tool descriptions into owned storage so they can be
     // borrowed into `tool_descs` alongside the static entries.

@@ -615,9 +615,514 @@ api_url = "https://ollama.com"
 api_key = "ollama_api_key_here"
 ```
 
-### Model Routing and Adaptive Classification
+### Agent Orchestration
 
-Route model calls by hint (`hint:fast`, `hint:reasoning`) using `[[model_routes]]`, and optionally enable automatic query classification to route messages to the best model tier. See [docs/config-reference.md](docs/config-reference.md) for `[[model_routes]]` and `[query_classification]` options.
+The `[agent]` section controls the core agent loop behavior — tool iterations, history management, dispatcher protocol, and context handling.
+
+```toml
+[agent]
+compact_context = false       # bootstrap with ~6K chars system prompt for small models (≤13B)
+max_tool_iterations = 10      # max consecutive tool call rounds per agent turn
+max_history_messages = 50     # conversation messages before auto-compaction triggers
+parallel_tools = false        # reserved for future parallel tool execution (sequential today)
+tool_dispatcher = "auto"      # tool calling protocol: "auto", "xml", "native"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `compact_context` | bool | `false` | When `true`, reduces the system prompt to ~6K chars. Use for small/quantized models (≤13B params) that have limited context windows. |
+| `max_tool_iterations` | usize | `10` | Maximum number of consecutive tool call → result → LLM rounds in a single agent turn. Prevents runaway loops. If the agent hits this limit, it returns whatever partial result is available. |
+| `max_history_messages` | usize | `50` | When conversation history exceeds this threshold, ZeroClaw auto-compacts older messages into a single LLM-generated summary. Keeps the 20 most recent messages intact. Compaction uses the current provider to summarize. |
+| `parallel_tools` | bool | `false` | **Reserved for future use.** Currently all tool calls execute sequentially in-order. When implemented, will allow concurrent tool execution within a single LLM response. |
+| `tool_dispatcher` | string | `"auto"` | Protocol for tool calling. `"auto"` selects based on provider capability: providers that support native function calling (OpenAI, Anthropic, etc.) use `"native"` (structured JSON tool calls), otherwise falls back to `"xml"` (XML-tagged tool calls in text). Force a specific mode with `"native"` or `"xml"`. |
+
+**How auto-compaction works:**
+
+1. When history exceeds `max_history_messages`, messages older than the 20 most recent are extracted.
+2. A transcript is built (max 12K chars) and sent to the LLM with a compaction prompt.
+3. The summary (max 2K chars) replaces the old segment as a single message.
+4. System prompt and recent 20 messages are always preserved intact.
+
+**Tool result truncation:** Individual tool results are truncated at 50K chars (~12.5K tokens) to prevent large outputs (e.g., shell commands returning megabytes) from overwhelming the LLM context window.
+
+### Delegate Agents (Sub-Agents)
+
+ZeroClaw supports **multi-agent delegation** — the primary agent can spawn sub-agents with different providers, models, and system prompts. Each sub-agent is defined as a named section under `[agents.<name>]`.
+
+```toml
+[agents.researcher]
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4-6"
+system_prompt = "You are a research assistant. Search the web and summarize findings concisely."
+temperature = 0.3
+max_depth = 3
+mode = "full"
+allowed_tools = ["web_search", "web_fetch", "file_read"]
+max_iterations = 15
+background = false
+
+[agents.coder]
+provider = "ollama"
+model = "qwen3"
+system_prompt = "You are a coding assistant. Write clean, tested code."
+mode = "simple"
+max_depth = 1
+
+[agents.reviewer]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+mode = "full"
+allowed_tools = ["file_read", "shell"]
+background = true
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `provider` | string | *required* | Provider name to use for this sub-agent (e.g., `"openrouter"`, `"ollama"`, `"anthropic"`). |
+| `model` | string | *required* | Model name/ID for this sub-agent (e.g., `"anthropic/claude-sonnet-4-6"`, `"llama3"`). |
+| `system_prompt` | string | `None` | Optional system prompt override. If omitted, the sub-agent inherits a generic system prompt. Use this to specialize agent behavior (researcher, coder, reviewer, etc.). |
+| `api_key` | string | `None` | Optional API key override. If omitted, uses the parent agent's API key or the provider's default. |
+| `temperature` | f64 | `None` | Optional temperature override for the sub-agent's LLM calls. If omitted, uses the global `default_temperature`. |
+| `max_depth` | u32 | `3` | Maximum recursion depth for nested delegation. Agent A (depth=0) delegates to Agent B (depth=1), which can delegate to Agent C (depth=2). At `max_depth`, further delegation is blocked. Prevents infinite delegation loops. |
+| `mode` | string | `"simple"` | Delegation execution mode. **`"simple"`**: single LLM call with system prompt, returns response directly — no tool use, fast, good for classification/summarization/translation tasks. **`"full"`**: multi-turn agent loop where the sub-agent can use tools from the parent's registry, respects `allowed_tools` and `max_iterations`. |
+| `allowed_tools` | string[] | `[]` | Tool allowlist for `"full"` mode. Empty list = sub-agent can use all tools from parent registry. Non-empty = only listed tools are available. Has no effect in `"simple"` mode. |
+| `max_iterations` | usize | `10` | Maximum tool iterations for `"full"` mode (like `agent.max_tool_iterations` but per sub-agent). |
+| `background` | bool | `false` | When `true`, the sub-agent runs asynchronously via `tokio::spawn()` and returns a task ID immediately (format: `dt-XXXXXXXX`). The parent agent can continue working and poll results later. When `false`, blocks until the sub-agent completes (120s timeout). |
+
+**Delegation tool actions:**
+
+The primary agent uses the built-in `delegate` tool to interact with sub-agents:
+
+| Action | Description |
+|--------|-------------|
+| `delegate` | Spawn a sub-agent with a prompt. Returns result directly (foreground) or task ID (background). |
+| `status` | Check the status of a background task by ID (`running`, `completed`, `failed`). |
+| `result` | Retrieve the completed output of a background task. Removes the task from tracking. |
+| `cancel` | Cancel a running background task. |
+| `list` | List all tracked background tasks with status and elapsed time. |
+
+**Background task limits:** Maximum 10 concurrent background tasks per delegate tool instance. Exceeding the limit returns an error.
+
+**Event integration:** When a background sub-agent completes, it emits a `SubAgentCompleted` event through the agent event bus, which is injected into the parent agent's conversation history at the next loop boundary.
+
+### Model Routing
+
+Route model calls by hint using `[[model_routes]]`. Hints are string labels (e.g., `"fast"`, `"reasoning"`, `"code"`) that map to specific provider+model combinations.
+
+```toml
+[[model_routes]]
+hint = "fast"
+provider = "openrouter"
+model = "meta-llama/llama-3.1-70b-instruct"
+
+[[model_routes]]
+hint = "reasoning"
+provider = "anthropic"
+model = "claude-opus-4-6"
+
+[[model_routes]]
+hint = "code"
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4-6"
+# api_key = "sk-override-..."   # optional per-route API key
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `hint` | string | *required* | The hint label that triggers this route. Used by query classification (automatic) or explicit `hint:<name>` prefix in user messages. |
+| `provider` | string | *required* | Provider to use when this hint is matched. |
+| `model` | string | *required* | Model to use when this hint is matched. |
+| `api_key` | string | `None` | Optional API key override for this specific route. |
+
+**How routing works:** When the agent loop receives a message, it checks for a `hint:<name>` prefix or a classification result. If a hint matches a `[[model_routes]]` entry, that provider+model is used for the LLM call instead of the default. If no match is found, the default provider+model is used.
+
+### Query Classification
+
+Optionally enable automatic query classification to route messages to the best model tier without manual `hint:` prefixes. Supports rule-based pattern matching and LLM-based adaptive classification.
+
+```toml
+[query_classification]
+enabled = true
+mode = "rules"                # "rules" (fast, no LLM call) or "adaptive" (LLM-based)
+
+# Rule-based classification: first matching rule wins (by priority, highest first)
+[[query_classification.rules]]
+hint = "fast"
+keywords = ["hello", "hi", "hey", "thanks", "how are you"]
+max_length = 100
+priority = 10
+
+[[query_classification.rules]]
+hint = "code"
+patterns = ["fn ", "class ", "def ", "```", "import "]
+priority = 5
+
+[[query_classification.rules]]
+hint = "reasoning"
+keywords = ["explain", "analyze", "why", "compare", "design"]
+min_length = 200
+priority = 3
+
+# Adaptive classification (LLM-based): uses a fast LLM call to classify
+[query_classification.adaptive]
+provider = "openrouter"                    # classifier LLM provider
+model = "meta-llama/llama-3.1-8b-instruct" # small fast model for classification
+chat_hint = "fast"                         # route "chat" category to "fast" hint
+simple_task_hint = ""                      # route "simple" to default model (no override)
+complex_task_hint = "reasoning"            # route "complex" to "reasoning" hint
+temperature = 0.0                          # deterministic classification
+```
+
+**`[query_classification]` top-level:**
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable automatic query classification. When disabled, all messages use the default model. |
+| `mode` | string | `"rules"` | Classification strategy. **`"rules"`**: fast local pattern matching against keyword/pattern rules — no LLM call, zero latency. **`"adaptive"`**: sends the user message to a small/fast LLM for classification, then falls back to rules on timeout or error. |
+
+**`[[query_classification.rules]]` entries:**
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `hint` | string | *required* | Model routing hint returned when this rule matches. Must match a `[[model_routes]]` entry. |
+| `keywords` | string[] | `[]` | Case-insensitive substring matches. If the user message contains any keyword, this rule is a candidate. |
+| `patterns` | string[] | `[]` | Case-sensitive literal matches. Useful for code markers like `"fn "`, `"class "`, `"```"`. If the message contains any pattern, this rule is a candidate. |
+| `min_length` | usize | `None` | Optional minimum message length (chars). Rule only applies to messages at least this long. |
+| `max_length` | usize | `None` | Optional maximum message length (chars). Rule only applies to messages at most this long. |
+| `priority` | i32 | `0` | Higher priority rules are checked first. First matching rule wins. |
+
+**`[query_classification.adaptive]`:**
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `provider` | string | `None` | Provider for the classifier LLM. If empty, uses the default provider. Recommend a small/fast model to minimize classification latency. |
+| `model` | string | `None` | Model for the classifier LLM. If empty, uses the default model. |
+| `api_key` | string | `None` | Optional API key override for the classifier. |
+| `chat_hint` | string | `"fast"` | Hint returned when the classifier categorizes a message as casual chat. |
+| `simple_task_hint` | string | `""` | Hint returned for simple tasks. Empty string means use the default model (no routing override). |
+| `complex_task_hint` | string | `"reasoning"` | Hint returned for complex tasks requiring deep reasoning. |
+| `temperature` | f64 | `0.0` | Temperature for the classifier LLM call. Use `0.0` for deterministic classification. |
+
+**Classification cascade (priority order):**
+
+1. If `enabled = false` → use default model, no classification.
+2. If `mode = "adaptive"` → send message to classifier LLM (5-second timeout). Maps result (`chat`/`simple`/`complex`) to the configured hint. On timeout/error, falls through to rules.
+3. Rules checked in priority order (highest first). Keywords are case-insensitive substrings, patterns are case-sensitive literals. Length constraints filter applicability. First match wins.
+4. No match → use default model.
+
+### Browser Automation
+
+ZeroClaw ships three browser backends plus a simple URL opener. All require `enabled = true` and at least one `allowed_domains` entry.
+
+**Quick activation:**
+
+```toml
+[browser]
+enabled = true
+allowed_domains = ["*"]       # or specific: ["github.com", "docs.rs", "*.example.com"]
+backend = "agent_browser"     # default — no build flags needed
+```
+
+**Backend comparison:**
+
+| Backend | Build flag needed? | Runtime dependency | Capabilities |
+|---------|-------------------|--------------------|--------------|
+| `agent_browser` | No | `npm install -g agent-browser` | DOM automation (click, fill, snapshot, screenshot, etc.) via Vercel CLI |
+| `rust_native` | **Yes:** `--features browser-native` | WebDriver (chromedriver) running | DOM automation via WebDriver W3C protocol, in-process session |
+| `computer_use` | No | External sidecar HTTP service | OS-level mouse, keyboard, screenshot actions |
+| `auto` | Depends | Tries all in order | Fallback chain: `rust_native` → `agent_browser` → `computer_use` |
+
+**Activating each backend:**
+
+```bash
+# agent_browser (default — no build changes needed)
+npm install -g agent-browser
+# Config: backend = "agent_browser"
+
+# rust_native (requires Cargo feature flag)
+cargo build --release --features browser-native
+chromedriver --port=9515 &
+# Config: backend = "rust_native"
+
+# computer_use (requires external sidecar)
+# Start your computer-use sidecar on port 9787
+# Config: backend = "computer_use"
+```
+
+**Two tools are registered when `browser.enabled = true`:**
+
+| Tool | Purpose | Protocol |
+|------|---------|----------|
+| `browser_open` | Opens HTTPS URLs in Brave Browser (no DOM access, no scraping). Safe for user-facing URLs. | Subprocess: `open -a "Brave Browser"` (macOS), `brave-browser` (Linux) |
+| `browser` | Full browser automation with configurable backend. Supports: open, click, fill, type, snapshot, screenshot, get_text, wait, hover, scroll, press, find, close, and OS-level actions (computer_use only). | Depends on backend |
+
+**Domain allowlist rules:**
+
+- Empty `allowed_domains` → all `open` actions rejected (secure default)
+- `"example.com"` → matches `example.com` and all subdomains (`sub.example.com`)
+- `"*.example.com"` → matches subdomains only (not `example.com` itself)
+- `"*"` → allows all domains (use with caution)
+- Private/local hosts (localhost, `10.x.x.x`, `192.168.x.x`, `127.x.x.x`, `file://`) are always blocked unless explicitly listed
+
+### Autonomy and Security
+
+The `[autonomy]` section controls what the agent can do without human approval.
+
+```toml
+[autonomy]
+level = "supervised"           # "readonly", "supervised", "full"
+workspace_only = true          # restrict file access to workspace directory
+allowed_commands = ["git", "npm", "cargo", "ls", "cat", "grep"]
+forbidden_paths = ["/etc", "/root", "/proc", "/sys", "~/.ssh", "~/.gnupg", "~/.aws"]
+max_actions_per_hour = 100     # rate limit for all tool actions
+max_cost_per_day_cents = 500   # daily LLM cost limit in cents
+require_approval_for_medium_risk = true
+block_high_risk_commands = true
+auto_approve = ["file_read", "memory_recall"]  # tools that never need approval
+always_ask = []                # tools that always require approval
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `level` | string | `"supervised"` | **`"readonly"`**: agent can read but cannot execute any write/shell actions. **`"supervised"`**: agent can execute tools but prompts for approval on medium/high risk actions. **`"full"`**: agent executes all tools without approval (use in trusted environments only). |
+| `workspace_only` | bool | `true` | When `true`, file read/write tools are scoped to the current workspace directory. Blocks access to system directories and parent traversal. |
+| `allowed_commands` | string[] | `[]` | Shell commands the agent is allowed to execute. Empty list = no shell access. Commands not in this list are blocked. |
+| `forbidden_paths` | string[] | `[]` | Filesystem paths that are always blocked, even within the workspace. Includes system directories and sensitive dotfiles. |
+| `max_actions_per_hour` | u32 | `100` | Rate limit across all tool actions per hour. Prevents runaway agents from consuming excessive resources. |
+| `max_cost_per_day_cents` | u32 | `500` | Daily LLM API cost limit in cents. Agent stops making LLM calls when the limit is reached. |
+| `require_approval_for_medium_risk` | bool | `true` | When `true`, medium-risk commands (file writes, network access) require user approval in supervised mode. |
+| `block_high_risk_commands` | bool | `true` | When `true`, high-risk commands (rm -rf, system modifications) are blocked even if in `allowed_commands`. |
+| `auto_approve` | string[] | `["file_read", "memory_recall"]` | Tools that are always auto-approved in supervised mode. These never prompt the user. |
+| `always_ask` | string[] | `[]` | Tools that always require explicit user approval, regardless of autonomy level. Overrides `auto_approve`. |
+
+### Reliability and Fallback
+
+The `[reliability]` section configures retry logic, provider fallback chains, and channel resilience.
+
+```toml
+[reliability]
+provider_retries = 2           # retry count per provider before fallback
+provider_backoff_ms = 500      # backoff between retries
+fallback_providers = ["openrouter", "ollama"]  # fallback chain if primary fails
+model_fallbacks = { "claude-opus-4-6" = ["claude-sonnet-4-6", "gpt-4o"] }
+
+channel_initial_backoff_secs = 2   # initial backoff for channel reconnection
+channel_max_backoff_secs = 60      # maximum backoff for channel reconnection
+scheduler_poll_secs = 15           # scheduler polling interval
+scheduler_retries = 2              # scheduler retry attempts
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `provider_retries` | u32 | `2` | Number of retries per provider before trying the next fallback provider. Applies exponential backoff. |
+| `provider_backoff_ms` | u64 | `500` | Base backoff duration between retries in milliseconds. Doubles on each retry. |
+| `fallback_providers` | string[] | `[]` | Ordered list of fallback providers. If the primary provider fails after all retries, the next provider in the list is tried. |
+| `api_keys` | string[] | `[]` | Additional API keys for round-robin distribution. Useful for load balancing across multiple API keys. |
+| `model_fallbacks` | map | `{}` | Per-model fallback chains. Key is the primary model, value is an ordered list of fallback models. |
+| `channel_initial_backoff_secs` | u64 | `2` | Initial backoff when a channel (Telegram, Discord, etc.) disconnects and needs reconnection. |
+| `channel_max_backoff_secs` | u64 | `60` | Maximum backoff cap for channel reconnection. Uses exponential backoff between initial and max. |
+| `scheduler_poll_secs` | u64 | `15` | How often the scheduler checks for pending tasks (in seconds). |
+| `scheduler_retries` | u32 | `2` | Number of retry attempts for failed scheduler tasks before giving up. |
+
+### Observability
+
+The `[observability]` section configures metrics and tracing.
+
+```toml
+[observability]
+backend = "log"                # "none", "log", "prometheus", "otel"
+# otel_endpoint = "http://localhost:4317"  # OTLP gRPC endpoint
+# otel_service_name = "zeroclaw"           # service name reported to OTel
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `backend` | string | `"log"` | Observability backend. **`"none"`**: no metrics or tracing. **`"log"`**: structured logging via `tracing` crate. **`"prometheus"`**: Prometheus metrics endpoint. **`"otel"`**: OpenTelemetry OTLP export. |
+| `otel_endpoint` | string | `None` | OTLP gRPC endpoint URL. Required when `backend = "otel"`. |
+| `otel_service_name` | string | `None` | Service name reported to OpenTelemetry collector. |
+
+### Logging
+
+```toml
+[logging]
+log_dir = "~/.zeroclaw/logs"
+file_logging = false           # enable file logging (in addition to stderr)
+rotation = "daily"             # "daily", "hourly", "never"
+max_files = 2                  # rotated files to keep
+level = "info"                 # "error", "warn", "info", "debug", "trace"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `log_dir` | string | `"~/.zeroclaw/logs"` | Directory for log files. Created automatically. |
+| `file_logging` | bool | `false` | When `true`, writes structured logs to files in `log_dir` in addition to stderr output. |
+| `rotation` | string | `"daily"` | Log file rotation strategy. |
+| `max_files` | u32 | `2` | Number of rotated log files to keep. Older files are deleted. |
+| `level` | string | `"info"` | Minimum log level. Also settable via `RUST_LOG` env var (env var takes precedence). |
+
+### Cost Tracking
+
+```toml
+[cost]
+enabled = false
+daily_limit_usd = 10.0
+monthly_limit_usd = 100.0
+warn_at_percent = 80           # warn when usage hits 80% of limit
+allow_override = false         # allow --override flag to bypass limits
+
+# Per-model pricing (price per 1M tokens)
+[cost.prices."anthropic/claude-sonnet-4-6"]
+input = 3.0
+output = 15.0
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable LLM cost tracking and enforcement. |
+| `daily_limit_usd` | f64 | `10.0` | Daily spending limit in USD. Agent stops making LLM calls when reached. |
+| `monthly_limit_usd` | f64 | `100.0` | Monthly spending limit in USD. |
+| `warn_at_percent` | u8 | `80` | Emit a warning when cost reaches this percentage of the limit. |
+| `allow_override` | bool | `false` | When `true`, allows `--override` CLI flag to bypass cost limits. |
+| `prices` | map | `{}` | Per-model pricing. Key is model ID, value has `input` and `output` fields (price per 1M tokens in USD). |
+
+### Web Search
+
+```toml
+[web_search]
+enabled = true
+provider = "duckduckgo"        # "duckduckgo" or "brave"
+# brave_api_key = "BSA..."     # required for brave provider
+max_results = 5
+timeout_secs = 15
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `true` | Enable the `web_search` tool. Uses outbound HTTP (no ports to configure). |
+| `provider` | string | `"duckduckgo"` | Search backend. DuckDuckGo requires no API key. Brave requires `brave_api_key`. |
+| `brave_api_key` | string | `None` | API key for Brave Search API. Required when `provider = "brave"`. |
+| `max_results` | usize | `5` | Maximum search results returned per query. |
+| `timeout_secs` | u64 | `15` | Timeout for search requests in seconds. |
+
+### HTTP Request Tool
+
+```toml
+[http_request]
+enabled = false
+allowed_domains = ["api.example.com"]
+max_response_size = 1000000    # 1MB
+timeout_secs = 30
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable the `http_request` tool for making arbitrary HTTP requests. |
+| `allowed_domains` | string[] | `[]` | Domain allowlist. Requests to unlisted domains are blocked. |
+| `max_response_size` | usize | `1000000` | Maximum response body size in bytes. Larger responses are truncated. |
+| `timeout_secs` | u64 | `30` | Request timeout in seconds. |
+
+### Proxy
+
+```toml
+[proxy]
+enabled = false
+http_proxy = "http://proxy.example.com:8080"
+https_proxy = "http://proxy.example.com:8080"
+# all_proxy = "socks5://..."   # fallback proxy
+no_proxy = ["localhost", "127.0.0.1"]
+scope = "zeroclaw"             # "environment", "zeroclaw", "services"
+# services = ["openai", "anthropic"]  # specific services (when scope = "services")
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable proxy for outbound HTTP/HTTPS requests. |
+| `http_proxy` | string | `None` | HTTP proxy URL. |
+| `https_proxy` | string | `None` | HTTPS proxy URL. |
+| `all_proxy` | string | `None` | Fallback proxy URL when http/https proxy is not set. |
+| `no_proxy` | string[] | `[]` | Hosts that bypass the proxy. |
+| `scope` | string | `"zeroclaw"` | **`"environment"`**: respect system env vars only. **`"zeroclaw"`**: apply proxy to all ZeroClaw outbound traffic. **`"services"`**: apply only to listed services. |
+| `services` | string[] | `[]` | Service selectors when `scope = "services"`. |
+
+### MCP (Model Context Protocol)
+
+```toml
+[mcp]
+enabled = false
+default_timeout_secs = 30
+
+[mcp.servers.filesystem]
+transport = "stdio"
+command = "npx"
+args = ["-y", "@anthropic/mcp-server-filesystem", "/home/user/workspace"]
+timeout_secs = 60
+
+[mcp.servers.remote-api]
+transport = "http"
+url = "https://mcp.example.com/v1"
+headers = { "Authorization" = "Bearer sk-..." }
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable MCP server connections. Registered MCP tools appear alongside built-in tools. |
+| `default_timeout_secs` | u64 | `30` | Default timeout for MCP tool calls. |
+| `servers` | map | `{}` | Named MCP server configurations. |
+
+**Per-server config (`[mcp.servers.<name>]`):**
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `transport` | string | *required* | **`"stdio"`**: spawn a subprocess, communicate via stdin/stdout. **`"http"`**: HTTP-based MCP endpoint. **`"sse"`**: Server-Sent Events transport. |
+| `command` | string | `None` | Command to spawn (stdio transport only). |
+| `args` | string[] | `[]` | Command arguments (stdio transport only). |
+| `env` | map | `{}` | Environment variables passed to the subprocess. |
+| `url` | string | `None` | Server URL (http/sse transport only). |
+| `headers` | map | `{}` | HTTP headers sent with requests (http/sse transport only). |
+| `timeout_secs` | u64 | `None` | Per-server timeout override. Falls back to `default_timeout_secs`. |
+| `auto_restart` | bool | `false` | Auto-restart the MCP server process if it crashes (stdio only). |
+
+### Events
+
+```toml
+[[events.sources]]
+source_type = "amqp"
+name = "rabbitmq"
+url = "amqp://guest:guest@localhost:5672"
+queue = "zeroclaw-events"
+prefetch_count = 1
+
+[[events.routes]]
+source = "rabbitmq"
+pattern = "deploy.*"
+prompt_template = "Deployment event from {source}: {payload}"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `sources` | array | `[]` | External event sources (AMQP queues, etc.). |
+| `routes` | array | `[]` | Event routing rules. Maps source+pattern to a prompt template or skill. |
+
+**Per-source:** `source_type`, `name`, `url`, `queue`, `routing_key` (optional), `prefetch_count` (default: 1).
+
+**Per-route:** `source` (matches source name), `pattern` (glob), `skill` (optional skill name), `prompt_template` (supports `{source}` and `{payload}` placeholders).
+
+### Peripherals (Hardware)
+
+```toml
+[peripherals]
+enabled = false
+
+[[peripherals.boards]]
+board = "nucleo-f401re"        # board type
+transport = "serial"           # "serial" or "probe"
+path = "/dev/ttyACM0"          # serial port path
+baud = 115200
+
+# datasheet_dir = "./datasheets"  # optional: PDF datasheets for RAG context
+```
+
+See [`docs/hardware-peripherals-design.md`](docs/hardware-peripherals-design.md) for firmware protocol and supported boards.
 
 ### Custom Provider Endpoints
 

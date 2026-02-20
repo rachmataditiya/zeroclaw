@@ -357,6 +357,36 @@ pub fn all_tools_with_runtime(
     tools
 }
 
+/// Extend a tools registry with MCP proxy tools if MCP is enabled.
+///
+/// Connects to all configured MCP servers, adds management tools
+/// (`mcp_list_servers`, `mcp_server_tools`) and creates proxy tools
+/// for each tool exposed by connected servers.
+///
+/// Returns the MCP manager (if created) so callers can collect tool
+/// descriptions for the system prompt.
+pub async fn extend_with_mcp(
+    tools: &mut Vec<Box<dyn Tool>>,
+    mcp_config: &crate::config::McpConfig,
+) -> Option<std::sync::Arc<crate::mcp::McpManager>> {
+    if !mcp_config.enabled || mcp_config.servers.is_empty() {
+        return None;
+    }
+
+    let manager = std::sync::Arc::new(crate::mcp::McpManager::new(mcp_config.clone()));
+    if let Err(e) = manager.connect_all().await {
+        tracing::warn!("MCP server connection errors: {e}");
+    }
+    tools.push(Box::new(McpListServersTool::new(manager.clone())));
+    tools.push(Box::new(McpServerToolsTool::new(manager.clone())));
+    let mcp_tools = manager.create_proxy_tools(manager.clone());
+    if !mcp_tools.is_empty() {
+        tracing::info!(count = mcp_tools.len(), "MCP proxy tools added");
+    }
+    tools.extend(mcp_tools);
+    Some(manager)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

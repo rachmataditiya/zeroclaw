@@ -269,7 +269,7 @@ async fn run_event_processor(config: Config) -> Result<()> {
         (None, None)
     };
 
-    let tools_registry = std::sync::Arc::new(crate::tools::all_tools_with_runtime(
+    let mut tools_vec = crate::tools::all_tools_with_runtime(
         std::sync::Arc::new(config.clone()),
         &security,
         runtime,
@@ -282,7 +282,9 @@ async fn run_event_processor(config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    ));
+    );
+    crate::tools::extend_with_mcp(&mut tools_vec, &config.mcp).await;
+    let tools_registry = std::sync::Arc::new(tools_vec);
 
     let model = config
         .default_model
