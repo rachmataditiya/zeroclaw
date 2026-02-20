@@ -1128,6 +1128,170 @@ See [`docs/hardware-peripherals-design.md`](docs/hardware-peripherals-design.md)
 
 For detailed configuration of custom OpenAI-compatible and Anthropic-compatible endpoints, see [docs/custom-providers.md](docs/custom-providers.md).
 
+### Skills System
+
+Skills are user-defined or community-built capabilities that extend the agent with domain-specific instructions, tools, and prompts. Skills are loaded at startup and injected into the agent's system prompt.
+
+**Skill locations:**
+
+| Source | Path | Priority |
+|--------|------|----------|
+| Workspace skills | `~/.zeroclaw/workspace/skills/<name>/` | Loaded first |
+| Open Skills (community) | `~/open-skills/` (auto-cloned from [besoeasy/open-skills](https://github.com/besoeasy/open-skills)) | Loaded second |
+
+**Two manifest formats:**
+
+Skills support `SKILL.toml` (structured, recommended) or `SKILL.md` (simple markdown). When both exist, TOML takes priority.
+
+#### SKILL.toml format (structured)
+
+```toml
+[skill]
+name = "inventory-checker"
+description = "Check and reconcile inventory data from ERP events"
+version = "1.0.0"
+author = "your-name"
+tags = ["erp", "inventory", "automation"]
+
+# Prompts are instructions injected into the agent's system prompt
+prompts = [
+    "When processing inventory events, always cross-check stock levels against the ERP database.",
+    "Report discrepancies as structured JSON with fields: item_id, expected, actual, diff.",
+    "If stock is below reorder_point, create a restock task using the schedule tool.",
+]
+
+# Tools are skill-specific capabilities the agent can use
+[[tools]]
+name = "check_stock"
+description = "Query current stock level for an item"
+kind = "shell"
+command = "curl -s http://erp.local/api/stock/{item_id}"
+
+[[tools]]
+name = "create_po"
+description = "Create a purchase order in the ERP"
+kind = "http"
+command = "https://erp.local/api/purchase-orders"
+
+[tools.args]
+method = "POST"
+content_type = "application/json"
+```
+
+#### SKILL.md format (simple)
+
+For quick skills that only need instructions (no custom tools), create a `SKILL.md` file. The entire content becomes the skill's prompt:
+
+```markdown
+# Order Processor
+
+You are an order processing assistant. When you receive order events:
+
+1. Validate the order payload (check required fields: customer_id, items, total)
+2. Use the shell tool to query the customer database: `curl http://erp.local/api/customers/{id}`
+3. Verify the customer exists and is active
+4. If the order is valid, confirm processing. If invalid, log the error with memory_store.
+5. For high-value orders (total > 10000), flag for manual review by saving to memory.
+```
+
+#### Managing skills
+
+```bash
+# List installed skills
+zeroclaw skills list
+
+# Install from GitHub
+zeroclaw skills install https://github.com/user/my-skill
+
+# Install from local path (creates symlink)
+zeroclaw skills install /path/to/my-skill
+
+# Remove a skill
+zeroclaw skills remove my-skill
+
+# Create a new skill manually
+mkdir -p ~/.zeroclaw/workspace/skills/my-skill
+cat > ~/.zeroclaw/workspace/skills/my-skill/SKILL.toml << 'EOF'
+[skill]
+name = "my-skill"
+description = "What this skill does"
+version = "0.1.0"
+EOF
+```
+
+#### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ZEROCLAW_OPEN_SKILLS_ENABLED` | `true` | Set to `false` to disable community open-skills auto-clone. |
+| `ZEROCLAW_OPEN_SKILLS_DIR` | `~/open-skills` | Custom path for the open-skills repository. |
+
+Open skills are auto-cloned on first run and auto-updated weekly (7-day sync interval).
+
+### Event-Driven Automation with Skills
+
+Events from external sources (RabbitMQ, etc.) can be routed to specific skills for autonomous processing. The agent receives the event payload, loads the targeted skill's instructions, and executes using all available tools (core + MCP + delegate).
+
+**Example: ERP event processing pipeline**
+
+```toml
+# Skills setup:
+# ~/.zeroclaw/workspace/skills/inventory-checker/SKILL.toml  (see example above)
+# ~/.zeroclaw/workspace/skills/order-processor/SKILL.md       (see example above)
+
+# MCP server for ERP integration
+[mcp]
+enabled = true
+
+[mcp.servers.erp-mcp]
+transport = "stdio"
+command = "erp-mcp-server"
+args = ["--config", "/etc/erp-mcp.json"]
+
+# Event source: RabbitMQ
+[[events.sources]]
+source_type = "amqp"
+name = "erp-events"
+url = "amqp://guest:guest@localhost:5672"
+queue = "zeroclaw-tasks"
+prefetch_count = 1
+
+# Route inventory events → inventory-checker skill
+[[events.routes]]
+source = "erp-events"
+pattern = "inventory.*"
+skill = "inventory-checker"
+prompt_template = "Process this inventory event and take appropriate action: {payload}"
+
+# Route order events → order-processor skill
+[[events.routes]]
+source = "erp-events"
+pattern = "orders.*"
+skill = "order-processor"
+prompt_template = "Handle this incoming order: {payload}"
+
+# Catch-all route for unmatched events
+[[events.routes]]
+source = "erp-events"
+prompt_template = "Received ERP event from {source}: {payload}. Analyze and take action if needed."
+```
+
+**Event processing flow:**
+
+1. RabbitMQ delivers message with routing key `inventory.update`
+2. Event processor matches route `pattern = "inventory.*"` → `skill = "inventory-checker"`
+3. Skill instructions + tools are injected into the agent prompt
+4. Agent runs full tool loop (shell, file, MCP tools, delegate, etc.) autonomously
+5. On success, event is acknowledged. On failure, message redelivers.
+
+**Key behaviors:**
+
+- Agent uses `max_tool_iterations` from `[agent]` config (default: 10)
+- All tools are available: core tools, MCP tools, delegate sub-agents
+- Memory context is recalled and auto-saved per event
+- Events without a matching route use the default template: `"Received event from {source}: {payload}"`
+- Events with a route but unknown skill name log a warning and process without skill instructions
+
 ## Python Companion Package (`zeroclaw-tools`)
 
 For LLM providers with inconsistent native tool calling (e.g., GLM-5/Zhipu), ZeroClaw ships a Python companion package with **LangGraph-based tool calling** for guaranteed consistency:
