@@ -113,6 +113,9 @@ portable-pty = "0.8"
 # Shell command parsing (process tool pipe-based spawn)
 shell-words = "1"
 
+# System information (system_info tool)
+sysinfo = { version = "0.34", default-features = false, features = ["system", "disk"] }
+
 # Discord WebSocket gateway
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }

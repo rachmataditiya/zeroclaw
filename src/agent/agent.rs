@@ -35,6 +35,11 @@ pub struct Agent {
     history: Vec<ConversationMessage>,
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
+    /// Separate lightweight provider for adaptive classification.
+    /// When `None`, the main `provider` is used for classification calls.
+    classifier_provider: Option<Box<dyn Provider>>,
+    /// Model name for the classifier (from adaptive config or default).
+    classifier_model: String,
 }
 
 pub struct AgentBuilder {
@@ -54,6 +59,8 @@ pub struct AgentBuilder {
     auto_save: Option<bool>,
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
+    classifier_provider: Option<Box<dyn Provider>>,
+    classifier_model: Option<String>,
 }
 
 impl AgentBuilder {
@@ -75,6 +82,8 @@ impl AgentBuilder {
             auto_save: None,
             classification_config: None,
             available_hints: None,
+            classifier_provider: None,
+            classifier_model: None,
         }
     }
 
@@ -161,6 +170,16 @@ impl AgentBuilder {
         self
     }
 
+    pub fn classifier_provider(mut self, provider: Option<Box<dyn Provider>>) -> Self {
+        self.classifier_provider = provider;
+        self
+    }
+
+    pub fn classifier_model(mut self, model: String) -> Self {
+        self.classifier_model = Some(model);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let tools = self
             .tools
@@ -202,6 +221,8 @@ impl AgentBuilder {
             history: Vec::new(),
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
+            classifier_provider: self.classifier_provider,
+            classifier_model: self.classifier_model.unwrap_or_default(),
         })
     }
 }
@@ -290,6 +311,34 @@ impl Agent {
         let available_hints: Vec<String> =
             config.model_routes.iter().map(|r| r.hint.clone()).collect();
 
+        // Create classifier provider for adaptive classification (if configured)
+        let adaptive = &config.query_classification.adaptive;
+        let classifier_provider: Option<Box<dyn Provider>> = if config.query_classification.enabled
+            && config.query_classification.mode == crate::config::ClassificationMode::Adaptive
+            && adaptive.provider.is_some()
+        {
+            let cls_provider_name = adaptive.provider.as_deref().unwrap();
+            match providers::create_provider_with_url(
+                cls_provider_name,
+                adaptive.api_key.as_deref().or(config.api_key.as_deref()),
+                None,
+            ) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        provider = cls_provider_name,
+                        "Failed to create classifier provider, falling back to main provider"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let classifier_model = adaptive.model.clone().unwrap_or_else(|| model_name.clone());
+
         Agent::builder()
             .provider(provider)
             .tools(tools)
@@ -307,6 +356,8 @@ impl Agent {
             .workspace_dir(config.workspace_dir.clone())
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
+            .classifier_provider(classifier_provider)
+            .classifier_model(classifier_model)
             .identity_config(config.identity.clone())
             .skills(crate::skills::load_skills(&config.workspace_dir))
             .auto_save(config.memory.auto_save)
@@ -407,12 +458,29 @@ impl Agent {
         results
     }
 
-    fn classify_model(&self, user_message: &str) -> String {
-        if let Some(hint) = super::classifier::classify(&self.classification_config, user_message) {
+    async fn classify_model(&self, user_message: &str) -> String {
+        // Use classifier_provider if available, otherwise fall back to main provider
+        let cls_provider: &dyn Provider = self
+            .classifier_provider
+            .as_deref()
+            .unwrap_or(self.provider.as_ref());
+
+        if let Some(hint) = super::classifier::classify_message(
+            &self.classification_config,
+            cls_provider,
+            &self.classifier_model,
+            user_message,
+        )
+        .await
+        {
             if self.available_hints.contains(&hint) {
                 tracing::info!(hint = hint.as_str(), "Auto-classified query");
                 return format!("hint:{hint}");
             }
+            tracing::warn!(
+                hint = hint.as_str(),
+                "Classification returned hint not in model_routes, using default"
+            );
         }
         self.model_name.clone()
     }
@@ -448,7 +516,7 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = self.classify_model(user_message);
+        let effective_model = self.classify_model(user_message).await;
 
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);

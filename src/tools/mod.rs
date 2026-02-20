@@ -19,19 +19,23 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod lang_exec;
 pub mod mcp_list_servers;
 pub mod mcp_proxy;
 pub mod mcp_server_tools;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod package_manager;
 pub mod process;
 pub mod proxy_config;
 pub mod pushover;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
+pub mod service_manager;
 pub mod shell;
+pub mod system_info;
 pub mod think;
 pub mod traits;
 pub mod web_fetch;
@@ -58,12 +62,14 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use lang_exec::LangExecTool;
 pub use mcp_list_servers::McpListServersTool;
 pub use mcp_proxy::McpProxyTool;
 pub use mcp_server_tools::McpServerToolsTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use package_manager::PackageManagerTool;
 pub use process::ProcessTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
@@ -71,7 +77,9 @@ pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
+pub use service_manager::ServiceManagerTool;
 pub use shell::ShellTool;
+pub use system_info::SystemInfoTool;
 pub use think::ThinkTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
@@ -185,6 +193,34 @@ fn build_core_tools(
             workspace_dir.to_path_buf(),
         )),
     ];
+
+    // ── Host autonomy tools ────────────────────────────────────────
+    // system_info is always available (read-only, low risk)
+    if root_config.system_info.enabled {
+        tools.push(Box::new(SystemInfoTool::new()));
+    }
+
+    if root_config.lang_exec.enabled {
+        tools.push(Box::new(LangExecTool::new(
+            security.clone(),
+            root_config.lang_exec.timeout_secs,
+            root_config.lang_exec.allowed_languages.clone(),
+        )));
+    }
+
+    if root_config.package_manager.enabled {
+        tools.push(Box::new(PackageManagerTool::new(
+            security.clone(),
+            root_config.package_manager.allowed_managers.clone(),
+        )));
+    }
+
+    if root_config.service_manager.enabled {
+        tools.push(Box::new(ServiceManagerTool::new(
+            security.clone(),
+            root_config.service_manager.allowed_actions.clone(),
+        )));
+    }
 
     if browser_config.enabled {
         tools.push(Box::new(BrowserOpenTool::new(

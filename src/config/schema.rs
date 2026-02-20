@@ -150,6 +150,22 @@ pub struct Config {
     /// Event-driven agent triggers configuration.
     #[serde(default)]
     pub events: EventsConfig,
+
+    /// Package manager tool configuration.
+    #[serde(default)]
+    pub package_manager: PackageManagerConfig,
+
+    /// Multi-language code execution tool configuration.
+    #[serde(default)]
+    pub lang_exec: LangExecConfig,
+
+    /// System information tool configuration.
+    #[serde(default)]
+    pub system_info: SystemInfoConfig,
+
+    /// Service/container manager tool configuration.
+    #[serde(default)]
+    pub service_manager: ServiceManagerConfig,
 }
 
 // ── Events ──────────────────────────────────────────────────────
@@ -2034,14 +2050,85 @@ pub struct ModelRouteConfig {
 
 // ── Query Classification ─────────────────────────────────────────
 
+/// Classification strategy: rule-based matching or LLM-based adaptive routing.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClassificationMode {
+    #[default]
+    Rules,
+    Adaptive,
+}
+
+/// Configuration for LLM-based adaptive classification.
+///
+/// When `mode = "adaptive"`, the agent makes a fast `simple_chat()` call to
+/// classify each message as chat/simple/complex before the main agent loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptiveClassificationConfig {
+    /// Provider name for the classifier LLM. If empty, uses the default provider.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model name for the classifier LLM. If empty, uses the default model.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional API key override for the classifier provider.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Hint to route chat messages to (e.g. "fast"). Empty = use default model.
+    #[serde(default = "default_chat_hint")]
+    pub chat_hint: String,
+    /// Hint to route simple task messages to. Empty = use default model.
+    #[serde(default)]
+    pub simple_task_hint: String,
+    /// Hint to route complex task messages to (e.g. "reasoning"). Empty = use default model.
+    #[serde(default = "default_complex_task_hint")]
+    pub complex_task_hint: String,
+    /// Temperature for the classifier LLM call.
+    #[serde(default = "default_classifier_temperature")]
+    pub temperature: f64,
+}
+
+fn default_chat_hint() -> String {
+    "fast".to_string()
+}
+
+fn default_complex_task_hint() -> String {
+    "reasoning".to_string()
+}
+
+fn default_classifier_temperature() -> f64 {
+    0.0
+}
+
+impl Default for AdaptiveClassificationConfig {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            model: None,
+            api_key: None,
+            chat_hint: default_chat_hint(),
+            simple_task_hint: String::new(),
+            complex_task_hint: default_complex_task_hint(),
+            temperature: default_classifier_temperature(),
+        }
+    }
+}
+
 /// Automatic query classification — classifies user messages by keyword/pattern
-/// and routes to the appropriate model hint. Disabled by default.
+/// or LLM-based adaptive routing, and routes to the appropriate model hint.
+/// Disabled by default.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct QueryClassificationConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Classification strategy: `rules` (keyword/pattern) or `adaptive` (LLM-based).
+    #[serde(default)]
+    pub mode: ClassificationMode,
     #[serde(default)]
     pub rules: Vec<ClassificationRule>,
+    /// Configuration for adaptive (LLM-based) classification.
+    #[serde(default)]
+    pub adaptive: AdaptiveClassificationConfig,
 }
 
 /// A single classification rule mapping message patterns to a model hint.
@@ -2064,6 +2151,72 @@ pub struct ClassificationRule {
     /// Higher priority rules are checked first.
     #[serde(default)]
     pub priority: i32,
+}
+
+// ── Host Autonomy Tools ──────────────────────────────────────────
+
+/// Configuration for the cross-platform package manager tool.
+/// Disabled by default (opt-in for security).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PackageManagerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed package managers (empty = auto-detect OS default).
+    #[serde(default)]
+    pub allowed_managers: Vec<String>,
+}
+
+/// Configuration for the multi-language code execution tool.
+/// Disabled by default (opt-in for security).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LangExecConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default timeout in seconds for code execution.
+    #[serde(default = "default_lang_exec_timeout")]
+    pub timeout_secs: u64,
+    /// Allowed languages (empty = all supported languages).
+    #[serde(default)]
+    pub allowed_languages: Vec<String>,
+}
+
+fn default_lang_exec_timeout() -> u64 {
+    30
+}
+
+impl Default for LangExecConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: default_lang_exec_timeout(),
+            allowed_languages: Vec::new(),
+        }
+    }
+}
+
+/// Configuration for the system information tool.
+/// Enabled by default (read-only, low risk).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemInfoConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for SystemInfoConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Configuration for the service/container manager tool.
+/// Disabled by default (opt-in for security — manages system services).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServiceManagerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed actions (empty = all actions). Example: `["status", "logs", "list", "docker_ps"]`
+    #[serde(default)]
+    pub allowed_actions: Vec<String>,
 }
 
 // ── Heartbeat ────────────────────────────────────────────────────
@@ -2644,6 +2797,10 @@ impl Default for Config {
             mcp: McpConfig::default(),
             events: EventsConfig::default(),
             query_classification: QueryClassificationConfig::default(),
+            package_manager: PackageManagerConfig::default(),
+            lang_exec: LangExecConfig::default(),
+            system_info: SystemInfoConfig::default(),
+            service_manager: ServiceManagerConfig::default(),
         }
     }
 }
@@ -3475,6 +3632,10 @@ default_temperature = 0.7
             hardware: HardwareConfig::default(),
             mcp: McpConfig::default(),
             events: EventsConfig::default(),
+            package_manager: PackageManagerConfig::default(),
+            lang_exec: LangExecConfig::default(),
+            system_info: SystemInfoConfig::default(),
+            service_manager: ServiceManagerConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -3617,6 +3778,10 @@ tool_dispatcher = "xml"
             hardware: HardwareConfig::default(),
             mcp: McpConfig::default(),
             events: EventsConfig::default(),
+            package_manager: PackageManagerConfig::default(),
+            lang_exec: LangExecConfig::default(),
+            system_info: SystemInfoConfig::default(),
+            service_manager: ServiceManagerConfig::default(),
         };
 
         config.save().unwrap();

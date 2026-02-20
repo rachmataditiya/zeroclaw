@@ -1208,6 +1208,74 @@ pub(crate) fn build_tool_instructions(
     instructions
 }
 
+/// Classify a message using adaptive or rules-based classification, returning
+/// the effective model name (which may be `hint:<name>` for routed models).
+///
+/// Cascade: adaptive → rules → default_model. Classification never blocks.
+async fn classify_for_loop(
+    config: &Config,
+    provider: &dyn Provider,
+    message: &str,
+    default_model: &str,
+) -> String {
+    if !config.query_classification.enabled {
+        return default_model.to_string();
+    }
+
+    let adaptive = &config.query_classification.adaptive;
+
+    // Build a classifier provider if adaptive.provider is set (and different from main)
+    let cls_provider_box: Option<Box<dyn Provider>> = if config.query_classification.mode
+        == crate::config::ClassificationMode::Adaptive
+        && adaptive.provider.is_some()
+    {
+        let cls_name = adaptive.provider.as_deref().unwrap();
+        match providers::create_provider_with_url(
+            cls_name,
+            adaptive.api_key.as_deref().or(config.api_key.as_deref()),
+            None,
+        ) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    provider = cls_name,
+                    "Failed to create classifier provider, falling back"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let cls_provider: &dyn Provider = cls_provider_box.as_deref().unwrap_or(provider);
+
+    let cls_model = adaptive.model.as_deref().unwrap_or(default_model);
+
+    let available_hints: Vec<String> = config.model_routes.iter().map(|r| r.hint.clone()).collect();
+
+    if let Some(hint) = super::classifier::classify_message(
+        &config.query_classification,
+        cls_provider,
+        cls_model,
+        message,
+    )
+    .await
+    {
+        if available_hints.contains(&hint) {
+            tracing::info!(hint = hint.as_str(), "Loop: auto-classified query");
+            return format!("hint:{hint}");
+        }
+        tracing::warn!(
+            hint = hint.as_str(),
+            "Loop: classification hint not in model_routes, using default"
+        );
+    }
+
+    default_model.to_string()
+}
+
 #[allow(clippy::too_many_lines)]
 pub async fn run(
     config: Config,
@@ -1544,13 +1612,16 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
+        // Classify the message to determine the effective model
+        let effective_model = classify_for_loop(&config, provider.as_ref(), &msg, model_name).await;
+
         let response = run_tool_call_loop(
             provider.as_ref(),
             &mut history,
             &tools_registry,
             observer.as_ref(),
             provider_name,
-            model_name,
+            &effective_model,
             temperature,
             false,
             Some(&approval_manager),
@@ -1670,13 +1741,17 @@ pub async fn run(
 
             history.push(ChatMessage::user(&enriched));
 
+            // Classify the message to determine the effective model
+            let effective_model =
+                classify_for_loop(&config, provider.as_ref(), &user_input, model_name).await;
+
             let response = match run_tool_call_loop(
                 provider.as_ref(),
                 &mut history,
                 &tools_registry,
                 observer.as_ref(),
                 provider_name,
-                model_name,
+                &effective_model,
                 temperature,
                 false,
                 Some(&approval_manager),
@@ -1938,13 +2013,16 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ChatMessage::user(&enriched),
     ];
 
+    // Classify the message to determine the effective model
+    let effective_model = classify_for_loop(&config, provider.as_ref(), message, &model_name).await;
+
     agent_turn(
         provider.as_ref(),
         &mut history,
         &tools_registry,
         observer.as_ref(),
         provider_name,
-        &model_name,
+        &effective_model,
         config.default_temperature,
         true,
         config.agent.max_tool_iterations,

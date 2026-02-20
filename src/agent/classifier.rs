@@ -1,4 +1,7 @@
-use crate::config::schema::QueryClassificationConfig;
+use crate::config::schema::{
+    AdaptiveClassificationConfig, ClassificationMode, QueryClassificationConfig,
+};
+use crate::providers::Provider;
 
 /// Classify a user message against the configured rules and return the
 /// matching hint string, if any.
@@ -47,13 +50,154 @@ pub fn classify(config: &QueryClassificationConfig, message: &str) -> Option<Str
     None
 }
 
+// ── Adaptive (LLM-based) classification ──────────────────────────
+
+/// Result of adaptive classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdaptiveCategory {
+    Chat,
+    SimpleTask,
+    ComplexTask,
+}
+
+/// Parse the LLM response into an `AdaptiveCategory`.
+///
+/// Tries exact match first, then fuzzy contains-based fallback.
+/// Defaults to `SimpleTask` for unrecognizable responses (safest default —
+/// uses the default model without extra reasoning overhead).
+pub fn parse_adaptive_response(response: &str) -> AdaptiveCategory {
+    let trimmed = response.trim().to_lowercase();
+
+    // Exact single-word match
+    match trimmed.as_str() {
+        "chat" => return AdaptiveCategory::Chat,
+        "simple" => return AdaptiveCategory::SimpleTask,
+        "complex" => return AdaptiveCategory::ComplexTask,
+        _ => {}
+    }
+
+    // Fuzzy fallback — check contains (order matters: complex before simple,
+    // since "complex" is more specific)
+    if trimmed.contains("complex") {
+        return AdaptiveCategory::ComplexTask;
+    }
+    if trimmed.contains("chat") {
+        return AdaptiveCategory::Chat;
+    }
+    if trimmed.contains("simple") {
+        return AdaptiveCategory::SimpleTask;
+    }
+
+    // Unknown → default to SimpleTask
+    AdaptiveCategory::SimpleTask
+}
+
+/// Map an `AdaptiveCategory` to the configured hint string.
+///
+/// Returns `None` if the hint is empty (meaning "use default model").
+fn category_to_hint(
+    category: AdaptiveCategory,
+    adaptive: &AdaptiveClassificationConfig,
+) -> Option<String> {
+    let hint = match category {
+        AdaptiveCategory::Chat => &adaptive.chat_hint,
+        AdaptiveCategory::SimpleTask => &adaptive.simple_task_hint,
+        AdaptiveCategory::ComplexTask => &adaptive.complex_task_hint,
+    };
+    if hint.is_empty() {
+        None
+    } else {
+        Some(hint.clone())
+    }
+}
+
+const CLASSIFICATION_PROMPT_TEMPLATE: &str = r#"Classify the user message into exactly one category.
+Reply with ONLY one word: chat, simple, or complex.
+
+- chat: casual conversation, greetings, small talk, simple questions with no action needed
+- simple: a clear task that can be done in 1-2 steps
+- complex: multi-step task requiring reasoning, planning, code generation, analysis, or delegation
+
+User message: "#;
+
+/// Perform adaptive LLM-based classification.
+///
+/// Makes a fast `simple_chat()` call to classify the message, then maps the
+/// category to a hint string. Returns `None` on any error (graceful fallback
+/// to rules-based classification or default model).
+///
+/// Applies a 5-second timeout to prevent blocking the agent loop.
+pub async fn adaptive_classify(
+    provider: &dyn Provider,
+    model: &str,
+    config: &AdaptiveClassificationConfig,
+    message: &str,
+) -> Option<String> {
+    let prompt = format!("{CLASSIFICATION_PROMPT_TEMPLATE}{message}");
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.simple_chat(&prompt, model, config.temperature),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(response)) => {
+            let category = parse_adaptive_response(&response);
+            tracing::info!(
+                response = response.trim(),
+                ?category,
+                "Adaptive classification result"
+            );
+            category_to_hint(category, config)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "Adaptive classification LLM call failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("Adaptive classification timed out (>5s)");
+            None
+        }
+    }
+}
+
+/// Top-level classification entry point that respects `ClassificationMode`.
+///
+/// Cascade: adaptive → rules → None (caller uses default model).
+pub async fn classify_message(
+    config: &QueryClassificationConfig,
+    provider: &dyn Provider,
+    model: &str,
+    message: &str,
+) -> Option<String> {
+    if !config.enabled {
+        return None;
+    }
+
+    // Try adaptive first if configured
+    if config.mode == ClassificationMode::Adaptive {
+        if let Some(hint) = adaptive_classify(provider, model, &config.adaptive, message).await {
+            return Some(hint);
+        }
+        // Fall through to rules on adaptive failure
+    }
+
+    // Rules-based classification
+    classify(config, message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::schema::{ClassificationRule, QueryClassificationConfig};
 
     fn make_config(enabled: bool, rules: Vec<ClassificationRule>) -> QueryClassificationConfig {
-        QueryClassificationConfig { enabled, rules }
+        QueryClassificationConfig {
+            enabled,
+            rules,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -168,5 +312,100 @@ mod tests {
             }],
         );
         assert_eq!(classify(&config, "something completely different"), None);
+    }
+
+    // ── Adaptive classification tests ────────────────────────────
+
+    #[test]
+    fn parse_exact_chat() {
+        assert_eq!(parse_adaptive_response("chat"), AdaptiveCategory::Chat);
+    }
+
+    #[test]
+    fn parse_exact_simple() {
+        assert_eq!(
+            parse_adaptive_response("simple"),
+            AdaptiveCategory::SimpleTask
+        );
+    }
+
+    #[test]
+    fn parse_exact_complex() {
+        assert_eq!(
+            parse_adaptive_response("complex"),
+            AdaptiveCategory::ComplexTask
+        );
+    }
+
+    #[test]
+    fn parse_with_whitespace_and_casing() {
+        assert_eq!(parse_adaptive_response("  Chat  "), AdaptiveCategory::Chat);
+        assert_eq!(
+            parse_adaptive_response("COMPLEX\n"),
+            AdaptiveCategory::ComplexTask
+        );
+        assert_eq!(
+            parse_adaptive_response(" Simple "),
+            AdaptiveCategory::SimpleTask
+        );
+    }
+
+    #[test]
+    fn parse_fuzzy_contains() {
+        assert_eq!(
+            parse_adaptive_response("I think this is complex"),
+            AdaptiveCategory::ComplexTask
+        );
+        assert_eq!(
+            parse_adaptive_response("this is a chat message"),
+            AdaptiveCategory::Chat
+        );
+        assert_eq!(
+            parse_adaptive_response("simple task"),
+            AdaptiveCategory::SimpleTask
+        );
+    }
+
+    #[test]
+    fn parse_unknown_defaults_to_simple_task() {
+        assert_eq!(
+            parse_adaptive_response("banana"),
+            AdaptiveCategory::SimpleTask
+        );
+        assert_eq!(parse_adaptive_response(""), AdaptiveCategory::SimpleTask);
+    }
+
+    #[test]
+    fn category_to_hint_empty_returns_none() {
+        let adaptive = AdaptiveClassificationConfig {
+            simple_task_hint: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(
+            category_to_hint(AdaptiveCategory::SimpleTask, &adaptive),
+            None
+        );
+    }
+
+    #[test]
+    fn category_to_hint_configured() {
+        let adaptive = AdaptiveClassificationConfig {
+            chat_hint: "fast".into(),
+            simple_task_hint: String::new(),
+            complex_task_hint: "reasoning".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            category_to_hint(AdaptiveCategory::Chat, &adaptive),
+            Some("fast".into())
+        );
+        assert_eq!(
+            category_to_hint(AdaptiveCategory::SimpleTask, &adaptive),
+            None
+        );
+        assert_eq!(
+            category_to_hint(AdaptiveCategory::ComplexTask, &adaptive),
+            Some("reasoning".into())
+        );
     }
 }

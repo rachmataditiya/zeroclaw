@@ -615,6 +615,10 @@ api_url = "https://ollama.com"
 api_key = "ollama_api_key_here"
 ```
 
+### Model Routing and Adaptive Classification
+
+Route model calls by hint (`hint:fast`, `hint:reasoning`) using `[[model_routes]]`, and optionally enable automatic query classification to route messages to the best model tier. See [docs/config-reference.md](docs/config-reference.md) for `[[model_routes]]` and `[query_classification]` options.
+
 ### Custom Provider Endpoints
 
 For detailed configuration of custom OpenAI-compatible and Anthropic-compatible endpoints, see [docs/custom-providers.md](docs/custom-providers.md).
