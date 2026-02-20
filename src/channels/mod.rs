@@ -7,6 +7,7 @@ pub mod irc;
 pub mod lark;
 pub mod matrix;
 pub mod mattermost;
+pub mod pipeline;
 pub mod qq;
 pub mod signal;
 pub mod slack;
@@ -27,6 +28,8 @@ pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
+#[allow(unused_imports)]
+pub use traits::StreamChunkConfig;
 pub use traits::{Channel, SendMessage};
 pub use whatsapp::WhatsAppChannel;
 
@@ -120,6 +123,7 @@ struct ChannelRuntimeContext {
     reliability: Arc<crate::config::ReliabilityConfig>,
     provider_runtime_options: providers::ProviderRuntimeOptions,
     workspace_dir: Arc<PathBuf>,
+    session_store: Option<Arc<crate::sessions::SessionStore>>,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -610,14 +614,46 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
-    // Build history from per-sender conversation cache
-    let mut prior_turns = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&history_key)
-        .cloned()
-        .unwrap_or_default();
+    // Build history from per-sender conversation cache.
+    // If session persistence is enabled and the in-memory cache is empty,
+    // attempt to load from disk.
+    let mut prior_turns = {
+        let cached = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&history_key)
+            .cloned()
+            .unwrap_or_default();
+
+        if cached.is_empty() {
+            if let Some(ref store) = ctx.session_store {
+                match store.load(&history_key).await {
+                    Ok(Some(persisted)) => {
+                        tracing::debug!(
+                            key = %history_key,
+                            messages = persisted.len(),
+                            "Loaded session from disk"
+                        );
+                        persisted
+                    }
+                    Ok(None) => Vec::new(),
+                    Err(e) => {
+                        tracing::warn!(
+                            key = %history_key,
+                            error = %e,
+                            "Failed to load session from disk"
+                        );
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            cached
+        }
+    };
 
     let mut history = vec![ChatMessage::system(ctx.system_prompt.as_str())];
     history.append(&mut prior_turns);
@@ -660,7 +696,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         None
     };
 
-    // Spawn a task to forward streaming deltas to draft updates
+    // Spawn a task to forward streaming deltas to draft updates.
+    // Uses paragraph-aware chunking: accumulates text and flushes on paragraph
+    // boundaries (\n\n) or when the buffer exceeds the channel's max chunk size,
+    // with an idle timer to flush partial content after a period of no new tokens.
     let draft_updater = if let (Some(mut rx), Some(draft_id_ref), Some(channel_ref)) = (
         delta_rx,
         draft_message_id.as_deref(),
@@ -669,15 +708,63 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         let channel = Arc::clone(channel_ref);
         let reply_target = msg.reply_target.clone();
         let draft_id = draft_id_ref.to_string();
+        let chunk_cfg = channel.stream_chunk_config();
         Some(tokio::spawn(async move {
-            let mut accumulated = String::new();
-            while let Some(delta) = rx.recv().await {
-                accumulated.push_str(&delta);
-                if let Err(e) = channel
-                    .update_draft(&reply_target, &draft_id, &accumulated)
-                    .await
-                {
-                    tracing::debug!("Draft update failed: {e}");
+            let mut accumulated = String::new(); // Full response so far
+            let mut pending_len = 0usize; // Chars since last draft update
+            let idle_dur = Duration::from_millis(chunk_cfg.idle_flush_ms);
+
+            loop {
+                let recv_result = tokio::time::timeout(idle_dur, rx.recv()).await;
+                match recv_result {
+                    Ok(Some(delta)) => {
+                        accumulated.push_str(&delta);
+                        pending_len += delta.len();
+
+                        // Flush conditions:
+                        // 1. Buffer exceeds max_chars
+                        // 2. Buffer has paragraph break and exceeds min_chars
+                        let has_paragraph_break = accumulated
+                            [accumulated.len().saturating_sub(pending_len)..]
+                            .contains("\n\n");
+
+                        let should_flush = pending_len >= chunk_cfg.max_chars
+                            || (has_paragraph_break && pending_len >= chunk_cfg.min_chars);
+
+                        if should_flush {
+                            if let Err(e) = channel
+                                .update_draft(&reply_target, &draft_id, &accumulated)
+                                .await
+                            {
+                                tracing::debug!("Draft update failed: {e}");
+                            }
+                            pending_len = 0;
+                        }
+                    }
+                    Ok(None) => {
+                        // Channel closed — flush any remaining content
+                        if pending_len > 0 {
+                            if let Err(e) = channel
+                                .update_draft(&reply_target, &draft_id, &accumulated)
+                                .await
+                            {
+                                tracing::debug!("Final draft update failed: {e}");
+                            }
+                        }
+                        break;
+                    }
+                    Err(_timeout) => {
+                        // Idle timeout — flush buffered content even if below min_chars
+                        if pending_len > 0 {
+                            if let Err(e) = channel
+                                .update_draft(&reply_target, &draft_id, &accumulated)
+                                .await
+                            {
+                                tracing::debug!("Idle flush draft update failed: {e}");
+                            }
+                            pending_len = 0;
+                        }
+                    }
                 }
             }
         }))
@@ -729,17 +816,29 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     match llm_result {
         Ok(Ok(response)) => {
             // Save user + assistant turn to per-sender history
+            let user_msg = ChatMessage::user(&enriched_message);
+            let assistant_msg = ChatMessage::assistant(&response);
             {
                 let mut histories = ctx
                     .conversation_histories
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                let turns = histories.entry(history_key).or_default();
-                turns.push(ChatMessage::user(&enriched_message));
-                turns.push(ChatMessage::assistant(&response));
+                let turns = histories.entry(history_key.clone()).or_default();
+                turns.push(user_msg.clone());
+                turns.push(assistant_msg.clone());
                 // Trim to MAX_CHANNEL_HISTORY (keep recent turns)
                 while turns.len() > MAX_CHANNEL_HISTORY {
                     turns.remove(0);
+                }
+            }
+
+            // Persist to disk if session store is enabled
+            if let Some(ref store) = ctx.session_store {
+                if let Err(e) = store.append(&history_key, &user_msg).await {
+                    tracing::warn!(key = %history_key, error = %e, "Failed to persist user message");
+                }
+                if let Err(e) = store.append(&history_key, &assistant_msg).await {
+                    tracing::warn!(key = %history_key, error = %e, "Failed to persist assistant message");
                 }
             }
             println!(
@@ -817,11 +916,25 @@ async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<traits::ChannelMessage>,
     ctx: Arc<ChannelRuntimeContext>,
     max_in_flight_messages: usize,
+    debounce_ms: u64,
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
     let mut workers = tokio::task::JoinSet::new();
+    let debounce_pipeline = pipeline::MessagePipeline::new(debounce_ms);
 
     while let Some(msg) = rx.recv().await {
+        // Debounce: coalesce rapid messages from the same sender.
+        let sender_key = conversation_history_key(&msg);
+        let pipeline = debounce_pipeline.clone();
+        let coalesced = pipeline.enqueue(&sender_key, msg.content.clone()).await;
+        let msg = match coalesced {
+            Some(combined) => traits::ChannelMessage {
+                content: combined,
+                ..msg
+            },
+            None => continue, // absorbed into a pending batch
+        };
+
         let permit = match Arc::clone(&semaphore).acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => break,
@@ -1870,6 +1983,28 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     provider_cache_seed.insert(provider_name.clone(), Arc::clone(&provider));
 
+    // Initialize session store if persistence is enabled
+    let session_store = if config.sessions.enabled {
+        let sessions_dir = config
+            .sessions
+            .base_dir
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config.workspace_dir.join("sessions"));
+        match crate::sessions::SessionStore::new(sessions_dir) {
+            Ok(store) => {
+                println!("  💾 Session persistence enabled");
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize session store: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
@@ -1891,9 +2026,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
         reliability: Arc::new(config.reliability.clone()),
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),
+        session_store,
     });
 
-    run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
+    run_message_dispatch_loop(
+        rx,
+        runtime_ctx,
+        max_in_flight_messages,
+        config.channels_config.debounce_ms,
+    )
+    .await;
 
     // Wait for all channel tasks
     for h in handles {
@@ -2281,6 +2423,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            session_store: None,
         });
 
         process_channel_message(
@@ -2333,6 +2476,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            session_store: None,
         });
 
         process_channel_message(
@@ -2394,6 +2538,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            session_store: None,
         });
 
         process_channel_message(
@@ -2476,6 +2621,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            session_store: None,
         });
 
         process_channel_message(
@@ -2534,6 +2680,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            session_store: None,
         });
 
         process_channel_message(
@@ -2587,6 +2734,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            session_store: None,
         });
 
         process_channel_message(
@@ -2691,6 +2839,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            session_store: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -2717,7 +2866,7 @@ mod tests {
         drop(tx);
 
         let started = Instant::now();
-        run_message_dispatch_loop(rx, runtime_ctx, 2).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 2, 0).await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -2761,6 +2910,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            session_store: None,
         });
 
         process_channel_message(
@@ -3165,6 +3315,7 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
+            session_store: None,
         });
 
         process_channel_message(

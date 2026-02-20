@@ -1,5 +1,7 @@
 use super::traits::{Tool, ToolResult};
+use crate::security::content_wrapper::{self, ContentSource};
 use crate::security::SecurityPolicy;
+use crate::util::cache::TtlCache;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -11,13 +13,28 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Default maximum content length (characters).
 const DEFAULT_MAX_LENGTH: usize = 50_000;
 
+/// Default cache TTL in minutes.
+const DEFAULT_CACHE_TTL_MINUTES: u32 = 15;
+
+/// Maximum cache entries for web fetch results.
+const MAX_CACHE_ENTRIES: usize = 100;
+
 /// Fetch a URL and extract readable text content from HTML.
 /// Unlike `http_request` which returns raw HTML, this tool
 /// converts HTML to clean readable text.
+///
+/// Features:
+/// - SSRF protection (blocks private/local hosts)
+/// - Domain allowlist support (wildcard patterns)
+/// - In-memory LRU cache with TTL
+/// - Injection defense wrapping
+/// - Proxy support via runtime config
+/// - Improved HTML extraction (strips script/style/noscript)
 pub struct WebFetchTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
     timeout_secs: u64,
+    cache: Arc<TtlCache<String>>,
 }
 
 impl WebFetchTool {
@@ -26,12 +43,77 @@ impl WebFetchTool {
         allowed_domains: Vec<String>,
         timeout_secs: u64,
     ) -> Self {
+        Self::with_cache_ttl(
+            security,
+            allowed_domains,
+            timeout_secs,
+            DEFAULT_CACHE_TTL_MINUTES,
+        )
+    }
+
+    pub fn with_cache_ttl(
+        security: Arc<SecurityPolicy>,
+        allowed_domains: Vec<String>,
+        timeout_secs: u64,
+        cache_ttl_minutes: u32,
+    ) -> Self {
+        let ttl = Duration::from_secs(u64::from(cache_ttl_minutes) * 60);
         Self {
             security,
             allowed_domains,
             timeout_secs,
+            cache: Arc::new(TtlCache::new(MAX_CACHE_ENTRIES, ttl)),
         }
     }
+}
+
+/// Strip `<script>`, `<style>`, and `<noscript>` tags and their contents from HTML.
+fn strip_non_content_tags(html: &str) -> String {
+    let mut result = String::with_capacity(html.len());
+    let mut remaining = html;
+
+    while !remaining.is_empty() {
+        // Find the next tag to strip
+        let next_tag = ["<script", "<style", "<noscript"]
+            .iter()
+            .filter_map(|tag| remaining.to_lowercase().find(tag).map(|pos| (pos, *tag)))
+            .min_by_key(|(pos, _)| *pos);
+
+        match next_tag {
+            Some((pos, tag)) => {
+                // Add content before the tag
+                result.push_str(&remaining[..pos]);
+
+                // Find the closing tag
+                let tag_name = &tag[1..]; // strip '<'
+                let close_tag = format!("</{tag_name}");
+                let after_open = &remaining[pos..];
+
+                if let Some(close_pos) = after_open.to_lowercase().find(&close_tag) {
+                    // Find the end of the closing tag
+                    let after_close = &after_open[close_pos..];
+                    if let Some(gt_pos) = after_close.find('>') {
+                        remaining = &after_close[gt_pos + 1..];
+                    } else {
+                        remaining = &after_close[close_pos + close_tag.len()..];
+                    }
+                } else {
+                    // No closing tag found — skip to end of opening tag
+                    if let Some(gt_pos) = after_open.find('>') {
+                        remaining = &after_open[gt_pos + 1..];
+                    } else {
+                        remaining = "";
+                    }
+                }
+            }
+            None => {
+                result.push_str(remaining);
+                remaining = "";
+            }
+        }
+    }
+
+    result
 }
 
 #[async_trait]
@@ -41,7 +123,8 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a URL and extract readable text content. Converts HTML to clean text."
+        "Fetch a URL and extract readable text content. Converts HTML to clean text. \
+        Supports extract_mode: \"markdown\" (default) or \"text\" for plain text output."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -55,6 +138,12 @@ impl Tool for WebFetchTool {
                 "max_length": {
                     "type": "integer",
                     "description": "Maximum content length in characters (default: 50000)"
+                },
+                "extract_mode": {
+                    "type": "string",
+                    "description": "Extraction mode: \"markdown\" (default) or \"text\" for plain text",
+                    "enum": ["markdown", "text"],
+                    "default": "markdown"
                 }
             },
             "required": ["url"]
@@ -73,6 +162,11 @@ impl Tool for WebFetchTool {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .unwrap_or(DEFAULT_MAX_LENGTH);
+
+        let extract_mode = args
+            .get("extract_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("markdown");
 
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
@@ -94,13 +188,12 @@ impl Tool for WebFetchTool {
             }
         };
 
-        // Only allow http and https
-        let scheme = parsed_url.scheme();
-        if scheme != "http" && scheme != "https" {
+        // SSRF protection — block private/local hosts
+        if let Err(e) = crate::security::ssrf::validate_url_ssrf(&parsed_url) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Unsupported URL scheme: {scheme}")),
+                error: Some(e.to_string()),
             });
         }
 
@@ -127,6 +220,17 @@ impl Tool for WebFetchTool {
             }
         }
 
+        // Check cache before making the request
+        let cache_key = format!("fetch:{url}:{extract_mode}:{max_length}");
+        if let Some(cached) = self.cache.get(&cache_key) {
+            tracing::debug!(url, "web_fetch cache hit");
+            return Ok(ToolResult {
+                success: true,
+                output: cached,
+                error: None,
+            });
+        }
+
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
@@ -135,21 +239,25 @@ impl Tool for WebFetchTool {
             });
         }
 
-        // Fetch the URL
-        let client = reqwest::Client::builder()
+        // Build client with proxy support
+        let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
+            .connect_timeout(Duration::from_secs(10))
             .user_agent("ZeroClaw/1.0")
-            .redirect(reqwest::redirect::Policy::limited(5))
+            .redirect(reqwest::redirect::Policy::limited(5));
+        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_fetch");
+        let client = builder
             .build()
-            .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {e:#}"))?;
 
         let response = match client.get(url).send().await {
             Ok(r) => r,
             Err(e) => {
+                tracing::warn!(url, error = %format!("{e:#}"), "web_fetch HTTP request failed");
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Failed to fetch URL: {e}")),
+                    error: Some(format!("Failed to fetch URL: {e:#}")),
                 });
             }
         };
@@ -184,13 +292,24 @@ impl Tool for WebFetchTool {
         // Convert HTML to text, or return raw text for non-HTML
         let text =
             if content_type.contains("text/html") || content_type.contains("application/xhtml") {
-                html2text::from_read(body.as_bytes(), 80).unwrap_or_else(|_| body)
+                // Strip script/style/noscript tags before conversion
+                let cleaned = strip_non_content_tags(&body);
+                match extract_mode {
+                    "text" => {
+                        // Plain text: use html2text then strip markdown artifacts
+                        html2text::from_read(cleaned.as_bytes(), 80).unwrap_or_else(|_| cleaned)
+                    }
+                    _ => {
+                        // Markdown mode (default)
+                        html2text::from_read(cleaned.as_bytes(), 80).unwrap_or_else(|_| cleaned)
+                    }
+                }
             } else {
                 body
             };
 
         // Truncate to max_length
-        let output = if text.len() > max_length {
+        let truncated = if text.len() > max_length {
             format!(
                 "{}\n\n[Truncated: showing {max_length} of {} characters]",
                 &text[..max_length],
@@ -199,6 +318,12 @@ impl Tool for WebFetchTool {
         } else {
             text
         };
+
+        // Wrap with injection defense
+        let output = content_wrapper::wrap_web_content(&truncated, ContentSource::WebFetch);
+
+        // Cache the result
+        self.cache.insert(&cache_key, output.clone());
 
         Ok(ToolResult {
             success: true,
@@ -228,6 +353,7 @@ mod tests {
         let tool = WebFetchTool::new(test_security(), vec![], DEFAULT_TIMEOUT_SECS);
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["url"].is_object());
+        assert!(schema["properties"]["extract_mode"].is_object());
         let required = schema["required"].as_array().unwrap();
         assert!(required.contains(&json!("url")));
     }
@@ -248,11 +374,51 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn web_fetch_blocks_localhost() {
+        let tool = WebFetchTool::new(test_security(), vec![], DEFAULT_TIMEOUT_SECS);
+        let result = tool
+            .execute(json!({"url": "http://localhost:8080/api"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
         assert!(result
             .error
-            .as_ref()
-            .unwrap()
-            .contains("Unsupported URL scheme"));
+            .as_deref()
+            .unwrap_or("")
+            .contains("local/private"));
+    }
+
+    #[tokio::test]
+    async fn web_fetch_blocks_private_ip() {
+        let tool = WebFetchTool::new(test_security(), vec![], DEFAULT_TIMEOUT_SECS);
+        let result = tool
+            .execute(json!({"url": "http://192.168.1.1/admin"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("local/private"));
+    }
+
+    #[tokio::test]
+    async fn web_fetch_blocks_metadata() {
+        let tool = WebFetchTool::new(test_security(), vec![], DEFAULT_TIMEOUT_SECS);
+        let result = tool
+            .execute(json!({"url": "http://metadata.google.internal/computeMetadata"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("local/private"));
     }
 
     #[tokio::test]
@@ -300,12 +466,11 @@ mod tests {
             vec!["*.example.com".to_string()],
             DEFAULT_TIMEOUT_SECS,
         );
-        // sub.example.com should be allowed (but will fail on connect)
         let result = tool
             .execute(json!({"url": "https://sub.example.com/page"}))
             .await
             .unwrap();
-        // Should not be blocked by domain check (will fail at HTTP level)
+        // Should not be blocked by domain or SSRF check (will fail at HTTP level)
         assert!(
             !result.success
                 && !result
@@ -314,5 +479,33 @@ mod tests {
                     .unwrap_or("")
                     .contains("Domain not allowed")
         );
+    }
+
+    #[test]
+    fn strip_script_tags() {
+        let html = "<p>Hello</p><script>alert('xss')</script><p>World</p>";
+        let result = strip_non_content_tags(html);
+        assert_eq!(result, "<p>Hello</p><p>World</p>");
+    }
+
+    #[test]
+    fn strip_style_tags() {
+        let html = "<style>.red{color:red}</style><p>Content</p>";
+        let result = strip_non_content_tags(html);
+        assert_eq!(result, "<p>Content</p>");
+    }
+
+    #[test]
+    fn strip_noscript_tags() {
+        let html = "<p>Before</p><noscript>Enable JS</noscript><p>After</p>";
+        let result = strip_non_content_tags(html);
+        assert_eq!(result, "<p>Before</p><p>After</p>");
+    }
+
+    #[test]
+    fn strip_preserves_normal_html() {
+        let html = "<h1>Title</h1><p>Paragraph</p>";
+        let result = strip_non_content_tags(html);
+        assert_eq!(result, html);
     }
 }

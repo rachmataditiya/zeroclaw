@@ -2,7 +2,7 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **February 18, 2026**.
+Last verified: **February 20, 2026**.
 
 Config file path:
 
@@ -21,11 +21,19 @@ Config file path:
 | Key | Default | Purpose |
 |---|---|---|
 | `max_tool_iterations` | `10` | Maximum tool-call loop turns per user message across CLI, gateway, and channels |
+| `max_history_messages` | `50` | Conversation messages before auto-compaction triggers |
+| `loop_detection` | `true` | Detect and break repetitive tool call patterns |
+| `loop_detection_warning_threshold` | `10` | Warn after N repeated same-tool calls |
+| `loop_detection_critical_threshold` | `20` | Break loop after N repeated same-tool calls |
+| `compaction_max_source_chars` | `24000` | Max transcript chars for compaction input |
+| `compaction_keep_recent` | `20` | Recent messages to preserve during compaction |
 
 Notes:
 
 - Setting `max_tool_iterations = 0` falls back to safe default `10`.
 - If a channel message exceeds this value, the runtime returns: `Agent exceeded maximum tool iterations (<value>)`.
+- Loop detection uses three detectors: generic repeat, no-progress poll (same result), and ping-pong alternation.
+- Auto-compaction uses staged summarization for large transcripts (>12K chars) and repairs orphaned tool results.
 
 ## `[gateway]`
 
@@ -49,6 +57,10 @@ Notes:
 ## `[channels_config]`
 
 Top-level channel options are configured under `channels_config`.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `debounce_ms` | `500` | Debounce window (ms) to coalesce rapid messages per sender. `0` = disabled. |
 
 Examples:
 
@@ -224,6 +236,75 @@ mode = "full"
 background = true
 max_iterations = 20
 ```
+
+## `[web_search]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Enable web search tool |
+| `provider` | `"duckduckgo"` | `duckduckgo`, `brave`, `perplexity`, `grok` |
+| `brave_api_key` | none | API key for Brave Search |
+| `perplexity_api_key` | none | API key for Perplexity (`pplx-*` = direct, `sk-or-*` = OpenRouter) |
+| `perplexity_base_url` | none | Custom base URL for Perplexity API |
+| `perplexity_model` | `"perplexity/sonar-pro"` | Model for Perplexity search |
+| `grok_api_key` | none | API key for xAI Grok |
+| `grok_model` | `"grok-4-1-fast"` | Model for Grok search |
+| `max_results` | `5` | Maximum search results |
+| `timeout_secs` | `15` | HTTP timeout |
+| `cache_ttl_minutes` | `15` | Cache TTL for search results. `0` = disabled. |
+
+Notes:
+
+- DuckDuckGo is free but uses HTML scraping (may be rate-limited).
+- Perplexity auto-detects endpoint from API key prefix.
+- Search results are wrapped with injection defense markers before passing to the LLM.
+
+## `[web_fetch]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Enable web fetch tool |
+| `timeout_secs` | `30` | HTTP timeout |
+| `max_length` | `50000` | Max response body characters |
+| `allowed_domains` | `[]` | Domain allowlist (empty = allow all) |
+| `cache_ttl_minutes` | `15` | Cache TTL for fetched pages. `0` = disabled. |
+
+Notes:
+
+- SSRF protection blocks requests to private IPs, localhost, and metadata endpoints.
+- Fetched content is wrapped with injection defense markers.
+
+## `[autonomy]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `tool_profile` | `"full"` | `minimal`, `standard`, `full` |
+| `tool_allow` | `[]` | Additional tools to allow (additive to profile) |
+| `tool_deny` | `[]` | Tools to deny (overrides profile and allow) |
+
+Profile definitions:
+
+- **minimal**: `memory_search`, `memory_get`, `web_search_tool`
+- **standard**: read tools + web_search + web_fetch + delegate + memory tools
+- **full**: all tools
+
+Notes:
+
+- `tool_deny` takes highest priority, then `tool_allow`, then profile base.
+- Denied tools return an error message to the LLM rather than silently skipping.
+
+## `[sessions]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable session persistence |
+| `max_age_days` | `30` | Auto-prune sessions older than N days |
+
+Notes:
+
+- Sessions are stored as JSONL files in `~/.zeroclaw/sessions/`.
+- Session key format: `{channel}_{sender}`.
+- History is loaded on message receive and appended after each turn.
 
 ## Security-Relevant Defaults
 

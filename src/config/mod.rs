@@ -14,7 +14,7 @@ pub use schema::{
     ObservabilityConfig, PackageManagerConfig, PeripheralBoardConfig, PeripheralsConfig,
     ProxyConfig, ProxyScope, QueryClassificationConfig, ReliabilityConfig, ResourceLimitsConfig,
     RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, SecretsConfig, SecurityConfig,
-    ServiceManagerConfig, SlackConfig, StorageConfig, StorageProviderConfig,
+    ServiceManagerConfig, SessionConfig, SlackConfig, StorageConfig, StorageProviderConfig,
     StorageProviderSection, StreamMode, SystemInfoConfig, TelegramConfig, TunnelConfig,
     WebSearchConfig, WebhookConfig,
 };

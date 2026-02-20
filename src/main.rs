@@ -68,6 +68,7 @@ mod providers;
 mod runtime;
 mod security;
 mod service;
+mod sessions;
 mod skillforge;
 mod skills;
 mod tools;

@@ -2,6 +2,8 @@
 //!
 //! This module contains reusable helper functions used across the codebase.
 
+pub mod cache;
+
 /// Truncate a string to at most `max_chars` characters, appending "..." if truncated.
 ///
 /// This function safely handles multi-byte UTF-8 characters (emoji, CJK, accented characters)

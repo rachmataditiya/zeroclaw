@@ -31,6 +31,79 @@ pub enum ToolOperation {
     Act,
 }
 
+/// Named tool permission profiles controlling which tools are available.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolProfile {
+    /// Read-only tools: memory_search, memory_get, web_search_tool.
+    Minimal,
+    /// All read tools + web_search + web_fetch + delegate.
+    Standard,
+    /// All tools including shell, file_write, http_request.
+    #[default]
+    Full,
+    /// Explicit list of allowed tool names.
+    Custom(Vec<String>),
+}
+
+const MINIMAL_TOOLS: &[&str] = &["memory_search", "memory_get", "web_search_tool"];
+
+const STANDARD_TOOLS: &[&str] = &[
+    "memory_search",
+    "memory_get",
+    "memory_store",
+    "web_search_tool",
+    "web_fetch",
+    "file_read",
+    "file_list",
+    "file_search",
+    "delegate",
+    "memory_recall",
+];
+
+impl ToolProfile {
+    /// Check if a tool name is included in this profile's base set.
+    fn includes(&self, tool_name: &str) -> bool {
+        match self {
+            Self::Minimal => MINIMAL_TOOLS.contains(&tool_name),
+            Self::Standard => STANDARD_TOOLS.contains(&tool_name),
+            Self::Full => true,
+            Self::Custom(tools) => tools.iter().any(|t| t == tool_name),
+        }
+    }
+}
+
+/// Tool access policy combining a profile with additive/subtractive overrides.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolPolicy {
+    #[serde(default)]
+    pub profile: ToolProfile,
+    /// Additional tools allowed on top of the profile.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Tools to deny even if the profile includes them.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl ToolPolicy {
+    /// Check if a tool is allowed by the policy.
+    pub fn is_tool_allowed(&self, tool_name: &str) -> bool {
+        // Deny list always wins
+        if self.deny.iter().any(|d| d == tool_name) {
+            return false;
+        }
+
+        // Allow list is additive
+        if self.allow.iter().any(|a| a == tool_name) {
+            return true;
+        }
+
+        // Check profile
+        self.profile.includes(tool_name)
+    }
+}
+
 /// Sliding-window action tracker for rate limiting.
 #[derive(Debug)]
 pub struct ActionTracker {
@@ -89,6 +162,7 @@ pub struct SecurityPolicy {
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
     pub tracker: ActionTracker,
+    pub tool_policy: ToolPolicy,
 }
 
 impl Default for SecurityPolicy {
@@ -206,6 +280,7 @@ impl Default for SecurityPolicy {
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             tracker: ActionTracker::new(),
+            tool_policy: ToolPolicy::default(),
         }
     }
 }
@@ -700,11 +775,21 @@ impl SecurityPolicy {
         self.tracker.count() >= self.max_actions_per_hour as usize
     }
 
+    /// Check if a tool is allowed by the tool policy.
+    pub fn is_tool_allowed(&self, tool_name: &str) -> bool {
+        self.tool_policy.is_tool_allowed(tool_name)
+    }
+
     /// Build from config sections
     pub fn from_config(
         autonomy_config: &crate::config::AutonomyConfig,
         workspace_dir: &Path,
     ) -> Self {
+        let tool_policy = ToolPolicy {
+            profile: autonomy_config.tool_profile.clone(),
+            allow: autonomy_config.tool_allow.clone(),
+            deny: autonomy_config.tool_deny.clone(),
+        };
         Self {
             autonomy: autonomy_config.level,
             workspace_dir: workspace_dir.to_path_buf(),
@@ -716,6 +801,7 @@ impl SecurityPolicy {
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
             tracker: ActionTracker::new(),
+            tool_policy,
         }
     }
 }
@@ -1708,5 +1794,126 @@ mod tests {
             !policy.is_path_allowed("subdir%2f..%2f..%2fetc"),
             "URL-encoded parent dir traversal must be blocked"
         );
+    }
+
+    // ── Tool Policy ─────────────────────────────────────────────
+
+    #[test]
+    fn tool_policy_full_allows_everything() {
+        let policy = ToolPolicy::default();
+        assert!(policy.is_tool_allowed("shell"));
+        assert!(policy.is_tool_allowed("file_write"));
+        assert!(policy.is_tool_allowed("http_request"));
+        assert!(policy.is_tool_allowed("memory_search"));
+    }
+
+    #[test]
+    fn tool_policy_minimal_restricts_to_read_tools() {
+        let policy = ToolPolicy {
+            profile: ToolProfile::Minimal,
+            allow: Vec::new(),
+            deny: Vec::new(),
+        };
+        assert!(policy.is_tool_allowed("memory_search"));
+        assert!(policy.is_tool_allowed("memory_get"));
+        assert!(policy.is_tool_allowed("web_search_tool"));
+        assert!(!policy.is_tool_allowed("shell"));
+        assert!(!policy.is_tool_allowed("file_write"));
+        assert!(!policy.is_tool_allowed("http_request"));
+    }
+
+    #[test]
+    fn tool_policy_standard_includes_read_and_web() {
+        let policy = ToolPolicy {
+            profile: ToolProfile::Standard,
+            allow: Vec::new(),
+            deny: Vec::new(),
+        };
+        assert!(policy.is_tool_allowed("memory_search"));
+        assert!(policy.is_tool_allowed("web_search_tool"));
+        assert!(policy.is_tool_allowed("web_fetch"));
+        assert!(policy.is_tool_allowed("file_read"));
+        assert!(policy.is_tool_allowed("delegate"));
+        assert!(!policy.is_tool_allowed("shell"));
+        assert!(!policy.is_tool_allowed("file_write"));
+        assert!(!policy.is_tool_allowed("http_request"));
+    }
+
+    #[test]
+    fn tool_policy_allow_additive() {
+        let policy = ToolPolicy {
+            profile: ToolProfile::Minimal,
+            allow: vec!["shell".into()],
+            deny: Vec::new(),
+        };
+        assert!(policy.is_tool_allowed("shell"));
+        assert!(policy.is_tool_allowed("memory_search"));
+        assert!(!policy.is_tool_allowed("file_write"));
+    }
+
+    #[test]
+    fn tool_policy_deny_overrides() {
+        let policy = ToolPolicy {
+            profile: ToolProfile::Full,
+            allow: Vec::new(),
+            deny: vec!["shell".into(), "http_request".into()],
+        };
+        assert!(!policy.is_tool_allowed("shell"));
+        assert!(!policy.is_tool_allowed("http_request"));
+        assert!(policy.is_tool_allowed("file_read"));
+        assert!(policy.is_tool_allowed("memory_search"));
+    }
+
+    #[test]
+    fn tool_policy_deny_overrides_allow() {
+        let policy = ToolPolicy {
+            profile: ToolProfile::Minimal,
+            allow: vec!["shell".into()],
+            deny: vec!["shell".into()],
+        };
+        // deny wins over allow
+        assert!(!policy.is_tool_allowed("shell"));
+    }
+
+    #[test]
+    fn tool_policy_custom_profile() {
+        let policy = ToolPolicy {
+            profile: ToolProfile::Custom(vec!["my_tool".into(), "another_tool".into()]),
+            allow: Vec::new(),
+            deny: Vec::new(),
+        };
+        assert!(policy.is_tool_allowed("my_tool"));
+        assert!(policy.is_tool_allowed("another_tool"));
+        assert!(!policy.is_tool_allowed("shell"));
+        assert!(!policy.is_tool_allowed("memory_search"));
+    }
+
+    #[test]
+    fn security_policy_is_tool_allowed_delegates_to_tool_policy() {
+        let policy = SecurityPolicy {
+            tool_policy: ToolPolicy {
+                profile: ToolProfile::Minimal,
+                allow: Vec::new(),
+                deny: Vec::new(),
+            },
+            ..SecurityPolicy::default()
+        };
+        assert!(policy.is_tool_allowed("memory_search"));
+        assert!(!policy.is_tool_allowed("shell"));
+    }
+
+    #[test]
+    fn security_policy_from_config_picks_up_tool_policy() {
+        let mut autonomy = crate::config::AutonomyConfig::default();
+        autonomy.tool_profile = ToolProfile::Standard;
+        autonomy.tool_allow = vec!["shell".into()];
+        autonomy.tool_deny = vec!["web_fetch".into()];
+
+        let policy = SecurityPolicy::from_config(&autonomy, Path::new("/tmp"));
+
+        assert!(policy.is_tool_allowed("memory_search")); // in Standard
+        assert!(policy.is_tool_allowed("shell")); // added via allow
+        assert!(!policy.is_tool_allowed("web_fetch")); // denied via deny
+        assert!(!policy.is_tool_allowed("http_request")); // not in Standard
     }
 }

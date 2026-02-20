@@ -418,7 +418,13 @@ impl Agent {
                     if r.success {
                         r.output
                     } else {
-                        format!("Error: {}", r.error.unwrap_or(r.output))
+                        let err_msg = r.error.unwrap_or(r.output);
+                        tracing::warn!(
+                            tool = %call.name,
+                            error = %err_msg,
+                            "Tool returned failure"
+                        );
+                        format!("Error: {err_msg}")
                     }
                 }
                 Err(e) => {
@@ -427,6 +433,11 @@ impl Agent {
                         duration: start.elapsed(),
                         success: false,
                     });
+                    tracing::warn!(
+                        tool = %call.name,
+                        error = %e,
+                        "Tool execution error"
+                    );
                     format!("Error executing {}: {e}", call.name)
                 }
             }

@@ -91,10 +91,16 @@ const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 const COMPACTION_KEEP_RECENT_MESSAGES: usize = 20;
 
 /// Safety cap for compaction source transcript passed to the summarizer.
-const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
+const COMPACTION_MAX_SOURCE_CHARS: usize = 24_000;
 
 /// Max characters retained in stored compaction summary.
-const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
+const COMPACTION_MAX_SUMMARY_CHARS: usize = 4_000;
+
+/// Threshold (chars) above which staged summarization splits input into chunks.
+const STAGED_COMPACTION_CHUNK_THRESHOLD: usize = 12_000;
+
+/// Maximum share of estimated context a single tool result may consume before truncation.
+const TOOL_RESULT_CONTEXT_SHARE_MAX: f32 = 0.25;
 
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
 fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
@@ -137,15 +143,20 @@ fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     history.drain(start..start + to_remove);
 }
 
-fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
+fn build_compaction_transcript(messages: &[ChatMessage], max_source_chars: usize) -> String {
     let mut transcript = String::new();
     for msg in messages {
         let role = msg.role.to_uppercase();
         let _ = writeln!(transcript, "{role}: {}", msg.content.trim());
     }
 
-    if transcript.chars().count() > COMPACTION_MAX_SOURCE_CHARS {
-        truncate_with_ellipsis(&transcript, COMPACTION_MAX_SOURCE_CHARS)
+    let cap = if max_source_chars == 0 {
+        COMPACTION_MAX_SOURCE_CHARS
+    } else {
+        max_source_chars
+    };
+    if transcript.chars().count() > cap {
+        truncate_with_ellipsis(&transcript, cap)
     } else {
         transcript
     }
@@ -161,11 +172,75 @@ fn apply_compaction_summary(
     history.splice(start..compact_end, std::iter::once(summary_msg));
 }
 
+/// Repair orphaned tool results after compaction/trimming.
+///
+/// A tool result message (role="tool" or content starting with "[Tool results]") is orphaned
+/// if its preceding assistant message (which should contain tool calls) was removed during
+/// compaction. This ensures history remains well-formed for providers that require
+/// tool_call → tool_result pairing.
+fn repair_orphaned_tool_results(history: &mut Vec<ChatMessage>) {
+    let mut i = 0;
+    while i < history.len() {
+        let is_tool_result = history[i].role == "tool"
+            || (history[i].role == "user" && history[i].content.starts_with("[Tool results]"));
+
+        if is_tool_result {
+            // Check if the previous message is an assistant message (expected pairing)
+            let has_preceding_assistant = i > 0 && history[i - 1].role == "assistant";
+            if !has_preceding_assistant {
+                tracing::debug!(
+                    index = i,
+                    role = %history[i].role,
+                    "Removing orphaned tool result message"
+                );
+                history.remove(i);
+                continue; // Don't increment — re-check new element at same index
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Guard tool result sizes in history before an LLM call.
+///
+/// Any single tool result that exceeds `max_share` of the estimated total context
+/// (measured in characters) is truncated with a placeholder. This prevents one large
+/// tool output from crowding out the rest of the conversation.
+fn guard_tool_result_sizes(history: &mut [ChatMessage], max_share: f32) {
+    let total_chars: usize = history.iter().map(|m| m.content.len()).sum();
+    if total_chars == 0 {
+        return;
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let budget = (total_chars as f64 * f64::from(max_share)) as usize;
+    // Only guard if budget is meaningful (> 1KB)
+    if budget < 1024 {
+        return;
+    }
+
+    for msg in history.iter_mut() {
+        let is_tool_output =
+            msg.role == "tool" || (msg.role == "user" && msg.content.starts_with("[Tool results]"));
+        if is_tool_output && msg.content.len() > budget {
+            tracing::debug!(
+                original_len = msg.content.len(),
+                budget,
+                "Truncating oversized tool result to fit context share"
+            );
+            msg.content = truncate_with_ellipsis(&msg.content, budget)
+                + "\n\n[... tool result truncated to fit context window]";
+        }
+    }
+}
+
 async fn auto_compact_history(
     history: &mut Vec<ChatMessage>,
     provider: &dyn Provider,
     model: &str,
     max_history: usize,
+    compaction_max_source_chars: usize,
+    compaction_keep_recent: usize,
 ) -> Result<bool> {
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
@@ -179,35 +254,134 @@ async fn auto_compact_history(
     }
 
     let start = if has_system { 1 } else { 0 };
-    let keep_recent = COMPACTION_KEEP_RECENT_MESSAGES.min(non_system_count);
+    let keep_recent_cfg = if compaction_keep_recent == 0 {
+        COMPACTION_KEEP_RECENT_MESSAGES
+    } else {
+        compaction_keep_recent
+    };
+    let keep_recent = keep_recent_cfg.min(non_system_count);
     let compact_count = non_system_count.saturating_sub(keep_recent);
     if compact_count == 0 {
         return Ok(false);
     }
 
+    let max_src = if compaction_max_source_chars == 0 {
+        COMPACTION_MAX_SOURCE_CHARS
+    } else {
+        compaction_max_source_chars
+    };
+
     let compact_end = start + compact_count;
     let to_compact: Vec<ChatMessage> = history[start..compact_end].to_vec();
-    let transcript = build_compaction_transcript(&to_compact);
+    let transcript = build_compaction_transcript(&to_compact, max_src);
 
     let summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
 
-    let summarizer_user = format!(
-        "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{}",
-        transcript
-    );
+    // Staged summarization: if transcript exceeds chunk threshold, split into
+    // 2-3 chunks, summarize each independently, then merge.
+    let summary_raw = if transcript.chars().count() > STAGED_COMPACTION_CHUNK_THRESHOLD {
+        staged_summarize(provider, model, summarizer_system, &transcript).await
+    } else {
+        let summarizer_user = format!(
+            "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{}",
+            transcript
+        );
 
-    let summary_raw = provider
-        .chat_with_system(Some(summarizer_system), &summarizer_user, model, 0.2)
-        .await
-        .unwrap_or_else(|_| {
-            // Fallback to deterministic local truncation when summarization fails.
-            truncate_with_ellipsis(&transcript, COMPACTION_MAX_SUMMARY_CHARS)
-        });
+        provider
+            .chat_with_system(Some(summarizer_system), &summarizer_user, model, 0.2)
+            .await
+            .unwrap_or_else(|_| truncate_with_ellipsis(&transcript, COMPACTION_MAX_SUMMARY_CHARS))
+    };
 
     let summary = truncate_with_ellipsis(&summary_raw, COMPACTION_MAX_SUMMARY_CHARS);
     apply_compaction_summary(history, start, compact_end, &summary);
 
+    // Repair any orphaned tool results created by the splice
+    repair_orphaned_tool_results(history);
+
     Ok(true)
+}
+
+/// Staged summarization: split a large transcript into chunks, summarize each,
+/// then merge partial summaries into a final summary.
+async fn staged_summarize(
+    provider: &dyn Provider,
+    model: &str,
+    system_prompt: &str,
+    transcript: &str,
+) -> String {
+    // Split transcript into roughly equal chunks by paragraph breaks
+    let total_len = transcript.len();
+    let chunk_count = if total_len > STAGED_COMPACTION_CHUNK_THRESHOLD * 2 {
+        3
+    } else {
+        2
+    };
+    let chunk_size = total_len / chunk_count;
+
+    let mut chunks = Vec::with_capacity(chunk_count);
+    let mut remaining = transcript;
+    for i in 0..chunk_count {
+        if i == chunk_count - 1 {
+            // Last chunk gets everything remaining
+            chunks.push(remaining);
+            break;
+        }
+        // Find a good split point near the chunk boundary (prefer newline)
+        let target = chunk_size;
+        let split_at = if target < remaining.len() {
+            // Search for nearest newline within ±500 chars of target
+            let search_start = target.saturating_sub(500);
+            let search_end = (target + 500).min(remaining.len());
+            remaining[search_start..search_end]
+                .rfind('\n')
+                .map(|pos| search_start + pos + 1)
+                .unwrap_or(target)
+        } else {
+            remaining.len()
+        };
+        let (chunk, rest) = remaining.split_at(split_at.min(remaining.len()));
+        chunks.push(chunk);
+        remaining = rest;
+    }
+
+    // Summarize each chunk independently
+    let mut partial_summaries = Vec::with_capacity(chunks.len());
+    for (i, chunk) in chunks.iter().enumerate() {
+        let prompt = format!(
+            "Summarize part {}/{} of the conversation history. Keep it short (max 6 bullet points).\n\n{}",
+            i + 1,
+            chunks.len(),
+            chunk
+        );
+
+        let partial = provider
+            .chat_with_system(Some(system_prompt), &prompt, model, 0.2)
+            .await
+            .unwrap_or_else(|_| {
+                truncate_with_ellipsis(chunk, COMPACTION_MAX_SUMMARY_CHARS / chunk_count)
+            });
+
+        partial_summaries.push(partial);
+    }
+
+    // Merge partial summaries into a final summary
+    let merged_input = partial_summaries
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("Part {} summary:\n{}", i + 1, s))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let merge_prompt = format!(
+        "Merge these partial conversation summaries into one cohesive summary. Keep it short (max 12 bullet points). Remove duplicates.\n\n{}",
+        merged_input
+    );
+
+    provider
+        .chat_with_system(Some(system_prompt), &merge_prompt, model, 0.2)
+        .await
+        .unwrap_or_else(|_| partial_summaries.join("\n"))
 }
 
 /// Build context preamble by searching memory for relevant entries.
@@ -904,6 +1078,42 @@ pub(crate) async fn run_tool_call_loop(
     max_tool_iterations: usize,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String> {
+    run_tool_call_loop_with_detection(
+        provider,
+        history,
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        approval,
+        channel_name,
+        max_tool_iterations,
+        on_delta,
+        None, // no loop detector
+        None, // no tool policy
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tool_call_loop_with_detection(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    silent: bool,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    max_tool_iterations: usize,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    mut loop_detector: Option<super::loop_detection::LoopDetector>,
+    tool_policy: Option<&crate::security::policy::ToolPolicy>,
+) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -1085,6 +1295,29 @@ pub(crate) async fn run_tool_call_loop(
             let _ = std::io::stdout().flush();
         }
 
+        // ── Loop detection check (before executing tools) ──
+        if let Some(ref mut detector) = loop_detector {
+            // Check for loops before executing the next batch
+            match detector.check() {
+                super::loop_detection::LoopDetection::Critical(msg) => {
+                    tracing::warn!("Loop detection CRITICAL: {msg}");
+                    history.push(ChatMessage::assistant(response_text.clone()));
+                    history.push(ChatMessage::user(format!(
+                        "[System: Loop detected] {msg}\n\
+                        You MUST take a completely different approach. Do NOT repeat the same tool calls."
+                    )));
+                    // Don't execute tools — force LLM to reconsider
+                    continue;
+                }
+                super::loop_detection::LoopDetection::Warning(msg) => {
+                    tracing::info!("Loop detection WARNING: {msg}");
+                    // Inject warning into history but continue executing
+                    history.push(ChatMessage::user(format!("[System: Possible loop] {msg}")));
+                }
+                super::loop_detection::LoopDetection::None => {}
+            }
+        }
+
         // Execute each tool call and build results.
         // `individual_results` tracks per-call output so that native-mode history
         // can emit one `role: tool` message per tool call with the correct ID.
@@ -1121,6 +1354,29 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
 
+            // ── Tool policy check ─────────────────────────────
+            if let Some(policy) = tool_policy {
+                if !policy.is_tool_allowed(&call.name) {
+                    tracing::info!(tool = %call.name, "Tool blocked by policy");
+                    let denied = format!(
+                        "Tool '{}' is not allowed by the current tool policy.",
+                        call.name
+                    );
+                    individual_results.push(denied.clone());
+                    let _ = writeln!(
+                        tool_results,
+                        "<tool_result name=\"{}\">\n{denied}\n</tool_result>",
+                        call.name
+                    );
+                    continue;
+                }
+            }
+
+            // Record tool call for loop detection
+            if let Some(ref mut detector) = loop_detector {
+                detector.record_call(&call.name, &call.arguments);
+            }
+
             observer.record_event(&ObserverEvent::ToolCallStart {
                 tool: call.name.clone(),
             });
@@ -1136,7 +1392,13 @@ pub(crate) async fn run_tool_call_loop(
                         if r.success {
                             scrub_credentials(&r.output)
                         } else {
-                            format!("Error: {}", r.error.unwrap_or_else(|| r.output))
+                            let err_msg = r.error.unwrap_or_else(|| r.output);
+                            tracing::warn!(
+                                tool = %call.name,
+                                error = %err_msg,
+                                "Tool returned failure"
+                            );
+                            format!("Error: {err_msg}")
                         }
                     }
                     Err(e) => {
@@ -1145,6 +1407,11 @@ pub(crate) async fn run_tool_call_loop(
                             duration: start.elapsed(),
                             success: false,
                         });
+                        tracing::warn!(
+                            tool = %call.name,
+                            error = %e,
+                            "Tool execution error"
+                        );
                         format!("Error executing {}: {e}", call.name)
                     }
                 }
@@ -1153,6 +1420,12 @@ pub(crate) async fn run_tool_call_loop(
             };
 
             let result = truncate_tool_result(&result);
+
+            // Record result for loop detection
+            if let Some(ref mut detector) = loop_detector {
+                detector.record_result(&call.name, &call.arguments, &result);
+            }
+
             individual_results.push(result.clone());
             let _ = writeln!(
                 tool_results,
@@ -1663,7 +1936,15 @@ pub async fn run(
         // Classify the message to determine the effective model
         let effective_model = classify_for_loop(&config, provider.as_ref(), &msg, model_name).await;
 
-        let response = run_tool_call_loop(
+        let loop_det = if config.agent.loop_detection {
+            Some(super::loop_detection::LoopDetector::new(
+                config.agent.loop_detection_warning_threshold,
+                config.agent.loop_detection_critical_threshold,
+            ))
+        } else {
+            None
+        };
+        let response = run_tool_call_loop_with_detection(
             provider.as_ref(),
             &mut history,
             &tools_registry,
@@ -1676,6 +1957,8 @@ pub async fn run(
             "cli",
             config.agent.max_tool_iterations,
             None,
+            loop_det,
+            Some(&security.tool_policy),
         )
         .await?;
         final_output = response.clone();
@@ -1817,7 +2100,15 @@ pub async fn run(
                 });
             }
 
-            let response = match run_tool_call_loop(
+            let loop_det = if config.agent.loop_detection {
+                Some(super::loop_detection::LoopDetector::new(
+                    config.agent.loop_detection_warning_threshold,
+                    config.agent.loop_detection_critical_threshold,
+                ))
+            } else {
+                None
+            };
+            let response = match run_tool_call_loop_with_detection(
                 provider.as_ref(),
                 &mut history,
                 &tools_registry,
@@ -1830,6 +2121,8 @@ pub async fn run(
                 "cli",
                 config.agent.max_tool_iterations,
                 None,
+                loop_det,
+                Some(&security.tool_policy),
             )
             .await
             {
@@ -1854,12 +2147,17 @@ pub async fn run(
             }
             observer.record_event(&ObserverEvent::TurnComplete);
 
+            // Guard oversized tool results before compaction
+            guard_tool_result_sizes(&mut history, TOOL_RESULT_CONTEXT_SHARE_MAX);
+
             // Auto-compaction before hard trimming to preserve long-context signal.
             if let Ok(compacted) = auto_compact_history(
                 &mut history,
                 provider.as_ref(),
                 model_name,
                 config.agent.max_history_messages,
+                config.agent.compaction_max_source_chars,
+                config.agent.compaction_keep_recent,
             )
             .await
             {
@@ -2512,7 +2810,7 @@ Done."#;
             ChatMessage::user("I like dark mode"),
             ChatMessage::assistant("Got it"),
         ];
-        let transcript = build_compaction_transcript(&messages);
+        let transcript = build_compaction_transcript(&messages, COMPACTION_MAX_SOURCE_CHARS);
         assert!(transcript.contains("USER: I like dark mode"));
         assert!(transcript.contains("ASSISTANT: Got it"));
     }

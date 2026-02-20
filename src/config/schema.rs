@@ -170,6 +170,10 @@ pub struct Config {
     /// Logging configuration (file logging, rotation).
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    /// Session persistence configuration.
+    #[serde(default)]
+    pub sessions: SessionConfig,
 }
 
 // ── Events ──────────────────────────────────────────────────────
@@ -428,6 +432,21 @@ pub struct AgentConfig {
     pub parallel_tools: bool,
     #[serde(default = "default_agent_tool_dispatcher")]
     pub tool_dispatcher: String,
+    /// Enable tool loop detection to break repetitive tool call patterns.
+    #[serde(default = "default_true")]
+    pub loop_detection: bool,
+    /// Warning threshold for loop detection (repeated calls before warning).
+    #[serde(default = "default_loop_detection_warning")]
+    pub loop_detection_warning_threshold: usize,
+    /// Critical threshold for loop detection (repeated calls before breaking loop).
+    #[serde(default = "default_loop_detection_critical")]
+    pub loop_detection_critical_threshold: usize,
+    /// Maximum source chars for compaction input.
+    #[serde(default = "default_compaction_max_source_chars")]
+    pub compaction_max_source_chars: usize,
+    /// Number of recent messages to keep during compaction.
+    #[serde(default = "default_compaction_keep_recent")]
+    pub compaction_keep_recent: usize,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -442,6 +461,22 @@ fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
 
+fn default_loop_detection_warning() -> usize {
+    10
+}
+
+fn default_loop_detection_critical() -> usize {
+    20
+}
+
+fn default_compaction_max_source_chars() -> usize {
+    24_000
+}
+
+fn default_compaction_keep_recent() -> usize {
+    20
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -450,6 +485,11 @@ impl Default for AgentConfig {
             max_history_messages: default_agent_max_history_messages(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
+            loop_detection: true,
+            loop_detection_warning_threshold: default_loop_detection_warning(),
+            loop_detection_critical_threshold: default_loop_detection_critical(),
+            compaction_max_source_chars: default_compaction_max_source_chars(),
+            compaction_keep_recent: default_compaction_keep_recent(),
         }
     }
 }
@@ -752,6 +792,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_debounce_ms() -> u64 {
+    500
+}
+
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
@@ -947,18 +991,36 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
+    /// Search provider: "duckduckgo", "brave", "perplexity", or "grok"
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
     /// Brave Search API key (required if provider is "brave")
     #[serde(default)]
     pub brave_api_key: Option<String>,
+    /// Perplexity API key (required if provider is "perplexity")
+    #[serde(default)]
+    pub perplexity_api_key: Option<String>,
+    /// Perplexity base URL (auto-detected from key prefix if not set)
+    #[serde(default)]
+    pub perplexity_base_url: Option<String>,
+    /// Perplexity model (default: "perplexity/sonar-pro")
+    #[serde(default)]
+    pub perplexity_model: Option<String>,
+    /// Grok (xAI) API key (required if provider is "grok")
+    #[serde(default)]
+    pub grok_api_key: Option<String>,
+    /// Grok model (default: "grok-4-1-fast")
+    #[serde(default)]
+    pub grok_model: Option<String>,
     /// Maximum results per search (1-10)
     #[serde(default = "default_web_search_max_results")]
     pub max_results: usize,
     /// Request timeout in seconds
     #[serde(default = "default_web_search_timeout_secs")]
     pub timeout_secs: u64,
+    /// Cache TTL in minutes (default: 15)
+    #[serde(default = "default_web_search_cache_ttl")]
+    pub cache_ttl_minutes: u32,
 }
 
 fn default_web_search_provider() -> String {
@@ -973,14 +1035,24 @@ fn default_web_search_timeout_secs() -> u64 {
     15
 }
 
+fn default_web_search_cache_ttl() -> u32 {
+    15
+}
+
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             provider: default_web_search_provider(),
             brave_api_key: None,
+            perplexity_api_key: None,
+            perplexity_base_url: None,
+            perplexity_model: None,
+            grok_api_key: None,
+            grok_model: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
+            cache_ttl_minutes: default_web_search_cache_ttl(),
         }
     }
 }
@@ -1732,6 +1804,37 @@ impl Default for LoggingConfig {
     }
 }
 
+// ── Sessions ──────────────────────────────────────────────────
+
+/// Configuration for session persistence (conversation history on disk).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionConfig {
+    /// Enable session persistence. When true, conversation history is saved to disk.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum age of stored sessions in days before automatic pruning.
+    #[serde(default = "default_session_max_age_days")]
+    pub max_age_days: u32,
+    /// Base directory for session files.
+    /// Default: `{workspace_dir}/sessions`
+    #[serde(default)]
+    pub base_dir: Option<String>,
+}
+
+fn default_session_max_age_days() -> u32 {
+    30
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_age_days: default_session_max_age_days(),
+            base_dir: None,
+        }
+    }
+}
+
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
@@ -1765,6 +1868,18 @@ pub struct AutonomyConfig {
 
     /// Tools that always require interactive approval, even after "Always".
     pub always_ask: Vec<String>,
+
+    /// Tool access profile: "minimal", "standard", "full", or custom list.
+    #[serde(default)]
+    pub tool_profile: crate::security::policy::ToolProfile,
+
+    /// Additional tools allowed on top of the profile.
+    #[serde(default)]
+    pub tool_allow: Vec<String>,
+
+    /// Tools denied even if the profile includes them.
+    #[serde(default)]
+    pub tool_deny: Vec<String>,
 }
 
 impl Default for AutonomyConfig {
@@ -1880,6 +1995,9 @@ impl Default for AutonomyConfig {
             block_high_risk_commands: true,
             auto_approve: vec!["file_read".into(), "memory_recall".into()],
             always_ask: vec![],
+            tool_profile: crate::security::policy::ToolProfile::default(),
+            tool_allow: Vec::new(),
+            tool_deny: Vec::new(),
         }
     }
 }
@@ -2409,6 +2527,11 @@ pub struct ChannelsConfig {
     pub lark: Option<LarkConfig>,
     pub dingtalk: Option<DingTalkConfig>,
     pub qq: Option<QQConfig>,
+
+    /// Debounce window in milliseconds for coalescing rapid messages per sender.
+    /// Set to 0 to disable debouncing. Default: 500ms.
+    #[serde(default = "default_debounce_ms")]
+    pub debounce_ms: u64,
 }
 
 impl Default for ChannelsConfig {
@@ -2429,6 +2552,7 @@ impl Default for ChannelsConfig {
             lark: None,
             dingtalk: None,
             qq: None,
+            debounce_ms: default_debounce_ms(),
         }
     }
 }
@@ -2867,6 +2991,7 @@ impl Default for Config {
             system_info: SystemInfoConfig::default(),
             service_manager: ServiceManagerConfig::default(),
             logging: LoggingConfig::default(),
+            sessions: SessionConfig::default(),
         }
     }
 }
@@ -3283,6 +3408,27 @@ impl Config {
             }
         }
 
+        // Perplexity API key: ZEROCLAW_PERPLEXITY_API_KEY or PERPLEXITY_API_KEY
+        if let Ok(api_key) = std::env::var("ZEROCLAW_PERPLEXITY_API_KEY")
+            .or_else(|_| std::env::var("PERPLEXITY_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_search.perplexity_api_key = Some(api_key.to_string());
+            }
+        }
+
+        // Grok API key: ZEROCLAW_GROK_API_KEY or GROK_API_KEY or XAI_API_KEY
+        if let Ok(api_key) = std::env::var("ZEROCLAW_GROK_API_KEY")
+            .or_else(|_| std::env::var("GROK_API_KEY"))
+            .or_else(|_| std::env::var("XAI_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_search.grok_api_key = Some(api_key.to_string());
+            }
+        }
+
         // Storage provider key (optional backend override): ZEROCLAW_STORAGE_PROVIDER
         if let Ok(provider) = std::env::var("ZEROCLAW_STORAGE_PROVIDER") {
             let provider = provider.trim();
@@ -3643,6 +3789,9 @@ default_temperature = 0.7
                 block_high_risk_commands: true,
                 auto_approve: vec!["file_read".into()],
                 always_ask: vec![],
+                tool_profile: crate::security::policy::ToolProfile::default(),
+                tool_allow: Vec::new(),
+                tool_deny: Vec::new(),
             },
             runtime: RuntimeConfig {
                 kind: "docker".into(),
@@ -3666,19 +3815,7 @@ default_temperature = 0.7
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     mention_only: false,
                 }),
-                discord: None,
-                slack: None,
-                mattermost: None,
-                webhook: None,
-                imessage: None,
-                matrix: None,
-                signal: None,
-                whatsapp: None,
-                email: None,
-                irc: None,
-                lark: None,
-                dingtalk: None,
-                qq: None,
+                ..ChannelsConfig::default()
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -3703,6 +3840,7 @@ default_temperature = 0.7
             system_info: SystemInfoConfig::default(),
             service_manager: ServiceManagerConfig::default(),
             logging: LoggingConfig::default(),
+            sessions: SessionConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -3850,6 +3988,7 @@ tool_dispatcher = "xml"
             system_info: SystemInfoConfig::default(),
             service_manager: ServiceManagerConfig::default(),
             logging: LoggingConfig::default(),
+            sessions: SessionConfig::default(),
         };
 
         config.save().unwrap();
@@ -4178,11 +4317,6 @@ allowed_users = ["@ops:matrix.org"]
     fn channels_config_with_imessage_and_matrix() {
         let c = ChannelsConfig {
             cli: true,
-            telegram: None,
-            discord: None,
-            slack: None,
-            mattermost: None,
-            webhook: None,
             imessage: Some(IMessageConfig {
                 allowed_contacts: vec!["+1".into()],
             }),
@@ -4194,13 +4328,7 @@ allowed_users = ["@ops:matrix.org"]
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
             }),
-            signal: None,
-            whatsapp: None,
-            email: None,
-            irc: None,
-            lark: None,
-            dingtalk: None,
-            qq: None,
+            ..ChannelsConfig::default()
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -4344,14 +4472,6 @@ channel_id = "C123"
     fn channels_config_with_whatsapp() {
         let c = ChannelsConfig {
             cli: true,
-            telegram: None,
-            discord: None,
-            slack: None,
-            mattermost: None,
-            webhook: None,
-            imessage: None,
-            matrix: None,
-            signal: None,
             whatsapp: Some(WhatsAppConfig {
                 access_token: "tok".into(),
                 phone_number_id: "123".into(),
@@ -4359,11 +4479,7 @@ channel_id = "C123"
                 app_secret: None,
                 allowed_numbers: vec!["+1".into()],
             }),
-            email: None,
-            irc: None,
-            lark: None,
-            dingtalk: None,
-            qq: None,
+            ..ChannelsConfig::default()
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

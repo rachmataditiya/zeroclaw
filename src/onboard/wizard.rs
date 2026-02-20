@@ -149,6 +149,7 @@ pub fn run_wizard() -> Result<Config> {
         system_info: crate::config::SystemInfoConfig::default(),
         service_manager: crate::config::ServiceManagerConfig::default(),
         logging: crate::config::LoggingConfig::default(),
+        sessions: crate::config::SessionConfig::default(),
     };
 
     println!(
@@ -382,6 +383,7 @@ pub fn run_quick_setup(
         system_info: crate::config::SystemInfoConfig::default(),
         service_manager: crate::config::ServiceManagerConfig::default(),
         logging: crate::config::LoggingConfig::default(),
+        sessions: crate::config::SessionConfig::default(),
     };
 
     config.save()?;
@@ -2469,20 +2471,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
     let mut config = ChannelsConfig {
         cli: true,
-        telegram: None,
-        discord: None,
-        slack: None,
-        mattermost: None,
-        webhook: None,
-        imessage: None,
-        matrix: None,
-        signal: None,
-        whatsapp: None,
-        email: None,
-        irc: None,
-        lark: None,
-        dingtalk: None,
-        qq: None,
+        ..ChannelsConfig::default()
     };
 
     loop {

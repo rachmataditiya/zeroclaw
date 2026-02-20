@@ -626,6 +626,11 @@ max_tool_iterations = 10      # max consecutive tool call rounds per agent turn
 max_history_messages = 50     # conversation messages before auto-compaction triggers
 parallel_tools = false        # reserved for future parallel tool execution (sequential today)
 tool_dispatcher = "auto"      # tool calling protocol: "auto", "xml", "native"
+loop_detection = true          # detect and break repetitive tool call patterns
+# loop_detection_warning_threshold = 10   # warn after N repeated tool calls
+# loop_detection_critical_threshold = 20  # break loop after N repeated tool calls
+# compaction_max_source_chars = 24000     # max transcript chars for compaction input
+# compaction_keep_recent = 20             # recent messages to preserve during compaction
 ```
 
 | Key | Type | Default | Description |
@@ -635,13 +640,21 @@ tool_dispatcher = "auto"      # tool calling protocol: "auto", "xml", "native"
 | `max_history_messages` | usize | `50` | When conversation history exceeds this threshold, ZeroClaw auto-compacts older messages into a single LLM-generated summary. Keeps the 20 most recent messages intact. Compaction uses the current provider to summarize. |
 | `parallel_tools` | bool | `false` | **Reserved for future use.** Currently all tool calls execute sequentially in-order. When implemented, will allow concurrent tool execution within a single LLM response. |
 | `tool_dispatcher` | string | `"auto"` | Protocol for tool calling. `"auto"` selects based on provider capability: providers that support native function calling (OpenAI, Anthropic, etc.) use `"native"` (structured JSON tool calls), otherwise falls back to `"xml"` (XML-tagged tool calls in text). Force a specific mode with `"native"` or `"xml"`. |
+| `loop_detection` | bool | `true` | Detect repetitive tool call patterns and inject warnings or break the loop. Uses three detectors: generic repeat, no-progress poll, and ping-pong alternation. |
+| `loop_detection_warning_threshold` | usize | `10` | Number of repeated same-tool calls before injecting a warning into history. |
+| `loop_detection_critical_threshold` | usize | `20` | Number of repeated same-tool calls before forcibly breaking the loop. |
+| `compaction_max_source_chars` | usize | `24000` | Maximum transcript characters fed to the compaction summarizer. |
+| `compaction_keep_recent` | usize | `20` | Number of recent messages to preserve intact during auto-compaction. |
 
 **How auto-compaction works:**
 
-1. When history exceeds `max_history_messages`, messages older than the 20 most recent are extracted.
-2. A transcript is built (max 12K chars) and sent to the LLM with a compaction prompt.
-3. The summary (max 2K chars) replaces the old segment as a single message.
-4. System prompt and recent 20 messages are always preserved intact.
+1. When history exceeds `max_history_messages`, messages older than `compaction_keep_recent` are extracted.
+2. For large transcripts (>12K chars), staged summarization splits the transcript into 2–3 chunks and summarizes each independently before merging.
+3. The summary (max 4K chars) replaces the old segment as a single message.
+4. Orphan repair ensures tool result messages have matching preceding assistant messages.
+5. System prompt and recent messages are always preserved intact.
+
+**Tool result context guard:** Before each LLM call, individual tool results that exceed 25% of total conversation context are truncated to prevent a single large result from dominating the context window.
 
 **Tool result truncation:** Individual tool results are truncated at 50K chars (~12.5K tokens) to prevent large outputs (e.g., shell commands returning megabytes) from overwhelming the LLM context window.
 
@@ -880,6 +893,9 @@ require_approval_for_medium_risk = true
 block_high_risk_commands = true
 auto_approve = ["file_read", "memory_recall"]  # tools that never need approval
 always_ask = []                # tools that always require approval
+tool_profile = "full"          # "minimal", "standard", "full", or custom list
+tool_allow = []                # additional tools on top of profile
+tool_deny = []                 # deny tools even if profile includes them
 ```
 
 | Key | Type | Default | Description |
@@ -894,6 +910,9 @@ always_ask = []                # tools that always require approval
 | `block_high_risk_commands` | bool | `true` | When `true`, high-risk commands (rm -rf, system modifications) are blocked even if in `allowed_commands`. |
 | `auto_approve` | string[] | `["file_read", "memory_recall"]` | Tools that are always auto-approved in supervised mode. These never prompt the user. |
 | `always_ask` | string[] | `[]` | Tools that always require explicit user approval, regardless of autonomy level. Overrides `auto_approve`. |
+| `tool_profile` | string | `"full"` | Named tool permission profile. **`"minimal"`**: memory_search, memory_get, web_search_tool only. **`"standard"`**: adds web_fetch, file_read, file_list, file_search, delegate, memory_store, memory_recall. **`"full"`**: all tools. |
+| `tool_allow` | string[] | `[]` | Additional tools allowed on top of the profile. Additive. |
+| `tool_deny` | string[] | `[]` | Tools denied even if the profile includes them. Deny always wins over allow. |
 
 ### Reliability and Fallback
 
@@ -990,19 +1009,31 @@ output = 15.0
 ```toml
 [web_search]
 enabled = true
-provider = "duckduckgo"        # "duckduckgo" or "brave"
+provider = "duckduckgo"        # "duckduckgo", "brave", "perplexity", or "grok"
 # brave_api_key = "BSA..."     # required for brave provider
+# perplexity_api_key = "pplx-..." # required for perplexity provider
+# perplexity_model = "perplexity/sonar-pro"
+# grok_api_key = "xai-..."     # required for grok provider
+# grok_model = "grok-4-1-fast"
 max_results = 5
 timeout_secs = 15
+cache_ttl_minutes = 15         # in-memory cache for repeated queries
+# freshness = "pw"             # recency filter: "pd" (day), "pw" (week), "pm" (month), "py" (year)
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Enable the `web_search` tool. Uses outbound HTTP (no ports to configure). |
-| `provider` | string | `"duckduckgo"` | Search backend. DuckDuckGo requires no API key. Brave requires `brave_api_key`. |
+| `provider` | string | `"duckduckgo"` | Search backend. `"duckduckgo"` (free, no key), `"brave"`, `"perplexity"` (via OpenRouter or direct), `"grok"` (xAI). |
 | `brave_api_key` | string | `None` | API key for Brave Search API. Required when `provider = "brave"`. |
+| `perplexity_api_key` | string | `None` | API key for Perplexity. `pplx-*` keys use direct API; `sk-or-*` keys route through OpenRouter. |
+| `perplexity_model` | string | `"perplexity/sonar-pro"` | Model for Perplexity search. Prefix is stripped for direct API calls. |
+| `perplexity_base_url` | string | `None` | Custom base URL. Auto-detected from API key prefix if omitted. |
+| `grok_api_key` | string | `None` | API key for xAI Grok search. Required when `provider = "grok"`. |
+| `grok_model` | string | `"grok-4-1-fast"` | Grok model to use for web search. |
 | `max_results` | usize | `5` | Maximum search results returned per query. |
 | `timeout_secs` | u64 | `15` | Timeout for search requests in seconds. |
+| `cache_ttl_minutes` | u32 | `15` | In-memory LRU cache TTL for search results. Avoids redundant API calls for repeated queries. |
 
 ### HTTP Request Tool
 
@@ -1020,6 +1051,34 @@ timeout_secs = 30
 | `allowed_domains` | string[] | `[]` | Domain allowlist. Requests to unlisted domains are blocked. |
 | `max_response_size` | usize | `1000000` | Maximum response body size in bytes. Larger responses are truncated. |
 | `timeout_secs` | u64 | `30` | Request timeout in seconds. |
+
+### Session Persistence
+
+Persist conversation history to disk as JSONL files so sessions survive daemon restarts. Each sender gets a separate session file at `{base_dir}/{channel}_{sender}.jsonl`.
+
+```toml
+[sessions]
+enabled = false                # enable session persistence
+max_age_days = 30              # auto-prune sessions older than N days
+# base_dir = "/path/to/sessions"  # default: {workspace_dir}/sessions
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable session persistence. When enabled, conversation history is appended to JSONL files on disk. |
+| `max_age_days` | u32 | `30` | Sessions older than this are auto-pruned. |
+| `base_dir` | string | `None` | Custom session directory. Defaults to `{workspace_dir}/sessions`. |
+
+### Channel Debounce
+
+```toml
+[channels_config]
+debounce_ms = 500              # coalesce rapid messages per sender (0 = disabled)
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `debounce_ms` | u64 | `500` | Debounce window in milliseconds. When a user sends multiple messages in rapid succession, they are coalesced into a single message before processing. Set to `0` to disable. |
 
 ### Proxy
 

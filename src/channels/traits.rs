@@ -1,5 +1,29 @@
 use async_trait::async_trait;
 
+/// Streaming chunk delivery configuration per channel.
+///
+/// Controls how streaming deltas are batched before sending draft updates.
+/// Channels can override the default to tune latency vs. API call frequency.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamChunkConfig {
+    /// Minimum characters to accumulate before sending a draft update.
+    pub min_chars: usize,
+    /// Maximum characters to buffer before forcing a flush.
+    pub max_chars: usize,
+    /// Milliseconds to wait for more tokens before flushing buffered content.
+    pub idle_flush_ms: u64,
+}
+
+impl Default for StreamChunkConfig {
+    fn default() -> Self {
+        Self {
+            min_chars: 80,
+            max_chars: 1200,
+            idle_flush_ms: 1000,
+        }
+    }
+}
+
 /// A message received from or sent to a channel
 #[derive(Debug, Clone)]
 pub struct ChannelMessage {
@@ -99,6 +123,15 @@ pub trait Channel: Send + Sync {
         _text: &str,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Streaming chunk configuration for this channel.
+    ///
+    /// Override to tune batch sizes and idle flush for the target platform.
+    /// For example, Discord may prefer larger chunks (fewer edits per second),
+    /// while Telegram can handle frequent small updates.
+    fn stream_chunk_config(&self) -> StreamChunkConfig {
+        StreamChunkConfig::default()
     }
 }
 

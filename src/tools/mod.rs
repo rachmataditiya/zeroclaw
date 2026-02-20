@@ -263,11 +263,19 @@ fn build_core_tools(
     )));
 
     if root_config.web_search.enabled {
-        tools.push(Box::new(WebSearchTool::new(
-            root_config.web_search.provider.clone(),
-            root_config.web_search.brave_api_key.clone(),
-            root_config.web_search.max_results,
-            root_config.web_search.timeout_secs,
+        let ws = &root_config.web_search;
+        tools.push(Box::new(WebSearchTool::with_all_providers(
+            ws.provider.clone(),
+            ws.brave_api_key.clone(),
+            ws.perplexity_api_key.clone(),
+            ws.perplexity_base_url.clone(),
+            ws.perplexity_model.clone(),
+            ws.grok_api_key.clone(),
+            ws.grok_model.clone(),
+            ws.max_results,
+            ws.timeout_secs,
+            None, // freshness set per-call
+            ws.cache_ttl_minutes,
         )));
     }
 

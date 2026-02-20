@@ -1,6 +1,7 @@
 pub mod audit;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
+pub mod content_wrapper;
 pub mod detect;
 pub mod docker;
 #[cfg(target_os = "linux")]
@@ -10,6 +11,7 @@ pub mod landlock;
 pub mod pairing;
 pub mod policy;
 pub mod secrets;
+pub mod ssrf;
 pub mod traits;
 
 #[allow(unused_imports)]
@@ -18,7 +20,8 @@ pub use audit::{AuditEvent, AuditEventType, AuditLogger};
 pub use detect::create_sandbox;
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
-pub use policy::{AutonomyLevel, SecurityPolicy};
+#[allow(unused_imports)]
+pub use policy::{AutonomyLevel, SecurityPolicy, ToolPolicy, ToolProfile};
 #[allow(unused_imports)]
 pub use secrets::SecretStore;
 #[allow(unused_imports)]

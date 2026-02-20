@@ -264,12 +264,17 @@ impl Tool for HttpRequestTool {
                     Err(e) => format!("[Failed to read response body: {e}]"),
                 };
 
+                let wrapped_body = crate::security::content_wrapper::wrap_web_content(
+                    &response_text,
+                    crate::security::content_wrapper::ContentSource::Api,
+                );
+
                 let output = format!(
                     "Status: {} {}\nResponse Headers: {}\n\nResponse Body:\n{}",
                     status_code,
                     status.canonical_reason().unwrap_or("Unknown"),
                     headers_text,
-                    response_text
+                    wrapped_body
                 );
 
                 Ok(ToolResult {
@@ -379,59 +384,9 @@ fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
     })
 }
 
+/// Re-export from shared SSRF guard module for backwards compatibility within this module.
 fn is_private_or_local_host(host: &str) -> bool {
-    // Strip brackets from IPv6 addresses like [::1]
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-
-    let has_local_tld = bare
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local");
-
-    if bare == "localhost" || bare.ends_with(".localhost") || has_local_tld {
-        return true;
-    }
-
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
-            std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
-        };
-    }
-
-    false
-}
-
-/// Returns true if the IPv4 address is not globally routable.
-fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
-    let [a, b, c, _] = v4.octets();
-    v4.is_loopback()                       // 127.0.0.0/8
-        || v4.is_private()                 // 10/8, 172.16/12, 192.168/16
-        || v4.is_link_local()              // 169.254.0.0/16
-        || v4.is_unspecified()             // 0.0.0.0
-        || v4.is_broadcast()              // 255.255.255.255
-        || v4.is_multicast()              // 224.0.0.0/4
-        || (a == 100 && (64..=127).contains(&b)) // Shared address space (RFC 6598)
-        || a >= 240                        // Reserved (240.0.0.0/4, except broadcast)
-        || (a == 192 && b == 0 && (c == 0 || c == 2)) // IETF assignments + TEST-NET-1
-        || (a == 198 && b == 51)           // Documentation (198.51.100.0/24)
-        || (a == 203 && b == 0)            // Documentation (203.0.113.0/24)
-        || (a == 198 && (18..=19).contains(&b)) // Benchmarking (198.18.0.0/15)
-}
-
-/// Returns true if the IPv6 address is not globally routable.
-fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
-    let segs = v6.segments();
-    v6.is_loopback()                       // ::1
-        || v6.is_unspecified()             // ::
-        || v6.is_multicast()              // ff00::/8
-        || (segs[0] & 0xfe00) == 0xfc00   // Unique-local (fc00::/7)
-        || (segs[0] & 0xffc0) == 0xfe80   // Link-local (fe80::/10)
-        || (segs[0] == 0x2001 && segs[1] == 0x0db8) // Documentation (2001:db8::/32)
-        || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
+    crate::security::ssrf::is_private_or_local_host(host)
 }
 
 #[cfg(test)]

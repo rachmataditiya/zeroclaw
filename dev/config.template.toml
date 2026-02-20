@@ -58,3 +58,53 @@ allow_public_bind = true
 # model = "llama-3.3-70b-versatile"
 # mode = "full"
 # background = true
+
+# ── Web Search (optional) ─────────────────────────────────
+# Supports 4 providers: duckduckgo (free), brave, perplexity, grok.
+#
+# [web_search]
+# enabled = true
+# provider = "duckduckgo"
+# # provider = "perplexity"
+# # perplexity_api_key = "pplx-..."
+# # perplexity_model = "perplexity/sonar-pro"
+# # provider = "grok"
+# # grok_api_key = "xai-..."
+# # grok_model = "grok-4-1-fast"
+# max_results = 5
+# timeout_secs = 15
+# cache_ttl_minutes = 15
+
+# ── Agent Loop (optional) ─────────────────────────────────
+# Controls tool iterations, loop detection, and context compaction.
+#
+# [agent]
+# max_tool_iterations = 10
+# max_history_messages = 50
+# loop_detection = true
+# loop_detection_warning_threshold = 10
+# loop_detection_critical_threshold = 20
+# compaction_max_source_chars = 24000
+# compaction_keep_recent = 20
+
+# ── Tool Policy (optional) ────────────────────────────────
+# Restrict which tools the agent can use.
+# Profiles: "minimal" (read-only), "standard" (read + web), "full" (all).
+#
+# [autonomy]
+# tool_profile = "full"
+# tool_allow = ["shell"]      # additive to profile
+# tool_deny = ["http_request"] # deny even if profile allows
+
+# ── Session Persistence (optional) ────────────────────────
+# Persist conversation history to disk as JSONL files.
+#
+# [sessions]
+# enabled = false
+# max_age_days = 30
+
+# ── Channel Debounce (optional) ───────────────────────────
+# Coalesce rapid messages from the same sender.
+#
+# [channels_config]
+# debounce_ms = 500
