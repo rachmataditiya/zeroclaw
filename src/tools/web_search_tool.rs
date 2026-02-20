@@ -83,11 +83,13 @@ impl WebSearchTool {
     }
 
     async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
-        let encoded_query = urlencoding::encode(query);
-        let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
+        // Use DDG Lite endpoint (POST form) — more reliable than html.duckduckgo.com
+        // which aggressively blocks non-browser TLS fingerprints (JA3/JA4).
+        let form_data = format!("q={}", urlencoding::encode(query));
 
-        let resp = super::curl_client::curl_get(
-            &search_url,
+        let resp = super::curl_client::curl_post_form(
+            "https://lite.duckduckgo.com/lite/",
+            &form_data,
             &[],
             Duration::from_secs(self.timeout_secs),
             Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
@@ -103,11 +105,15 @@ impl WebSearchTool {
     }
 
     fn parse_duckduckgo_results(&self, html: &str, query: &str) -> anyhow::Result<String> {
-        let link_regex = Regex::new(
-            r#"<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#,
-        )?;
+        // DDG Lite format uses simple table rows:
+        //   <a rel="nofollow" href="URL" class="result-link">Title</a>
+        //   <td class="result-snippet">Snippet text</td>
+        // Attribute order varies, so we match any <a> with class="result-link" and extract href separately.
+        let link_regex =
+            Regex::new(r#"<a[^>]*\bclass="result-link"[^>]*>([\s\S]*?)</a>"#)?;
+        let href_regex = Regex::new(r#"href="([^"]+)""#)?;
 
-        let snippet_regex = Regex::new(r#"<a class="result__snippet[^"]*"[^>]*>([\s\S]*?)</a>"#)?;
+        let snippet_regex = Regex::new(r#"<td[^>]*class="result-snippet"[^>]*>([\s\S]*?)</td>"#)?;
 
         let link_matches: Vec<_> = link_regex
             .captures_iter(html)
@@ -129,8 +135,13 @@ impl WebSearchTool {
 
         for i in 0..count {
             let caps = &link_matches[i];
-            let url_str = decode_ddg_redirect_url(&caps[1]);
-            let title = strip_tags(&caps[2]);
+            let full_tag = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+            let url_str = href_regex
+                .captures(full_tag)
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str())
+                .unwrap_or("");
+            let title = strip_tags(&caps[1]);
 
             lines.push(format!("{}. {}", i + 1, title.trim()));
             lines.push(format!("   {}", url_str.trim()));
@@ -390,18 +401,6 @@ impl WebSearchTool {
     }
 }
 
-fn decode_ddg_redirect_url(raw_url: &str) -> String {
-    if let Some(index) = raw_url.find("uddg=") {
-        let encoded = &raw_url[index + 5..];
-        let encoded = encoded.split('&').next().unwrap_or(encoded);
-        if let Ok(decoded) = urlencoding::decode(encoded) {
-            return decoded.into_owned();
-        }
-    }
-
-    raw_url.to_string()
-}
-
 fn strip_tags(content: &str) -> String {
     let re = Regex::new(r"<[^>]+>").unwrap();
     re.replace_all(content, "").to_string()
@@ -593,8 +592,8 @@ mod tests {
     fn test_parse_duckduckgo_results_with_data() {
         let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
         let html = r#"
-            <a class="result__a" href="https://example.com">Example Title</a>
-            <a class="result__snippet">This is a description</a>
+            <a rel="nofollow" href="https://example.com" class="result-link">Example Title</a>
+            <td class="result-snippet">This is a description</td>
         "#;
         let result = tool.parse_duckduckgo_results(html, "test").unwrap();
         assert!(result.contains("Example Title"));
@@ -602,23 +601,22 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_duckduckgo_results_decodes_redirect_url() {
+    fn test_parse_duckduckgo_results_direct_urls() {
         let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
         let html = r#"
-            <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpath%3Fa%3D1&amp;rut=test">Example Title</a>
-            <a class="result__snippet">This is a description</a>
+            <a rel="nofollow" href="https://example.com/path?a=1" class="result-link">Example Title</a>
+            <td class="result-snippet">This is a description</td>
         "#;
         let result = tool.parse_duckduckgo_results(html, "test").unwrap();
         assert!(result.contains("https://example.com/path?a=1"));
-        assert!(!result.contains("rut=test"));
     }
 
     #[test]
     fn test_constructor_clamps_web_search_limits() {
         let tool = WebSearchTool::new("duckduckgo".to_string(), None, 0, 0);
         let html = r#"
-            <a class="result__a" href="https://example.com">Example Title</a>
-            <a class="result__snippet">This is a description</a>
+            <a rel="nofollow" href="https://example.com" class="result-link">Example Title</a>
+            <td class="result-snippet">This is a description</td>
         "#;
         let result = tool.parse_duckduckgo_results(html, "test").unwrap();
         assert!(result.contains("Example Title"));
